@@ -1,0 +1,163 @@
+---
+title: "Component 9 — Composite & Storytelling"
+---
+
+Four products that tie every measurement together: **Five-Tool Scoreboard**,
+**Player of the Game**, **Rivalry Radar**, and **Prospect Spotlight**.
+
+## Five-Tool Scoreboard
+
+The problem with blending speed, power and arm is that they are measured in
+different things — mph on the run, mph off the bat, mph on the throw. Averaging
+them directly is meaningless.
+
+The fix is to convert each tool to a **league percentile first**, then average.
+That makes the blend honest, and it makes the output instantly legible: a 97
+means *better than 97 % of the league*.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-fivetool
+#| eval: false
+source("../R/R09_composite.R")
+
+five <- five_tool_scoreboard(burner, smash, cannons, min_tools = 2, top = 10)
+five
+plot_five_tool(five, player = "PHD-8007")
+```
+
+### Python
+
+```{python}
+#| label: py-fivetool
+#| eval: false
+from components import c09_composite as c09
+c09.five_tool_scoreboard(burner, smash, cannons, top=10)
+```
+
+:::
+
+| player | speed pct | power pct | arm pct | tools | score |
+|---|---|---|---|---|---|
+| PHD-8007 | 98.6 | 98.1 | 97.8 | 3 | **98.2** |
+| ANI-8572 | 94.9 | 99.4 | 99.2 | 3 | 97.8 |
+| VAS-7028 | 98.3 | 99.4 | 94.3 | 3 | 97.3 |
+
+::: {.callout-note}
+`tools_measured` is reported alongside the score. A player with only two
+measured tools is not silently flattered by having the third ignored — the
+reader can see exactly what went into the number.
+:::
+
+## Player of the Game
+
+Not a box-score line, but a **win-probability** line: who actually did the most
+to win it. Batters are credited with their WPA; pitchers are credited with the
+*negative* of the WPA they allowed.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-potg
+#| eval: false
+player_of_the_game(pbp, "y1_d122_IOL_VAS", top = 5)
+```
+
+### Python
+
+```{python}
+#| label: py-potg
+#| eval: false
+c09.player_of_the_game(enriched, "y1_d122_IOL_VAS", top=5)
+```
+
+:::
+
+In the showcase game the engine's pick was the hitter who homered in the bottom
+of the 11th — a single swing worth **+83 %** of win probability.
+
+## Rivalry Radar
+
+Team-vs-team tale of the tape, built entirely from tracking aggregates rather
+than a traditional box score.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-rivalry
+#| eval: false
+rivalry_radar(pbp, "VAS", "IOL")
+```
+
+### Python
+
+```{python}
+#| label: py-rivalry
+#| eval: false
+c09.rivalry_radar(enriched, tabs["hits"], tabs["sprints"], lu, "VAS", "IOL")
+```
+
+:::
+
+Comparing average exit velocity, WPA per plate appearance and the count of
+high-leverage trips gives a matchup preview that says something a standings
+table cannot.
+
+## Prospect Spotlight
+
+One player's tool grades, in the shape a scoreboard animates: value, league
+percentile, and a scouting-style grade.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-prospect
+#| eval: false
+prospect_spotlight("PHD-8007", burner, smash, cannons, baselines)
+```
+
+### Python
+
+```{python}
+#| label: py-prospect
+#| eval: false
+c09.prospect_spotlight("PHD-8007", burner, smash, cannons, baselines)
+```
+
+:::
+
+| tool | value | percentile | grade |
+|---|---|---|---|
+| speed | 21.9 mph | 98.6 | ELITE |
+| power | 124.8 mph | 98.1 | ELITE |
+| arm | 96.5 mph | 97.8 | ELITE |
+
+Grades follow the familiar scouting ladder — ELITE, PLUS-PLUS, PLUS, AVERAGE,
+BELOW AVG — so the graphic reads the same way a scout's report does.
+
+## Putting it on the screen
+
+Every component in this book feeds one decision: **what goes on the big screen
+right now?** The Highlight Score answers it by fusing game importance with
+physical spectacle:
+
+$$\text{HighlightScore} = 100 \times \frac{\sum_i w_i s_i}{\sum_i w_i}$$
+
+Each component is mapped to a common 0–1 excitement scale before combining, so
+mph, feet and probabilities can be weighed against each other honestly.
+Measurements missing for a play are dropped and the weights renormalize — a play
+is never penalized for lacking a sensor reading.
+
+The validation that matters: the engine's highest-scoring moments of the season
+are **walk-off home runs in extra innings and game-ending outs at leverage
+4.8–8.2** — the same plays a human editor would choose, arrived at from tracking
+data alone.

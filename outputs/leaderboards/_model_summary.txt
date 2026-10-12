@@ -1,0 +1,5 @@
+Catch Probability Model (logistic regression, numpy)
+features: route_ft, hang_s, req_speed (standardized)
+n_opportunities=7058  base_catch_rate=0.850
+accuracy=0.954  brier_score=0.039
+weights(bias,route,hang,req)=[3.013, -1.809, 0.609, -2.112]

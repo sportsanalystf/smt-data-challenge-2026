@@ -1,0 +1,191 @@
+---
+title: "Component 8 — Fan-Interactive Games"
+---
+
+Five crowd games: **Catch or No Catch?**, **Out or Safe?**, **Guess the Gun**,
+**How Far Did It Go?**, and **Beat the Burner**.
+
+::: {.callout-important}
+## The design rule that makes these work
+
+A question is only worth asking when the answer is genuinely uncertain. A prompt
+the crowd gets right 95 % of the time is a formality, not a game.
+
+So every selector below ranks candidate plays by **suspense**, not by size. The
+most spectacular catch of the night is usually a *bad* vote — everyone can see
+it was caught. The best vote is the one the model itself is unsure about.
+:::
+
+We define suspense directly from the model's own uncertainty:
+
+$$\text{suspense} = 1 - \left|\,2\left(P - 0.5\right)\right|$$
+
+which peaks at $P = 0.5$ and falls to zero at either certainty.
+
+## Catch or No Catch?
+
+Freeze at contact, take the vote, then reveal the model's odds and the outcome.
+Only fly balls with catch probability between 0.25 and 0.75 qualify.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-catchvote
+#| eval: false
+source("../R/R08_fan_interactive.R")
+catch_or_no_catch(scored, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-catchvote
+#| eval: false
+from components import c08_fan_interactive as c08
+scored = model.score_frame(tabs["catches"])
+c08.catch_or_no_catch(scored, top=10)
+```
+
+:::
+
+Each row carries the prompt, the two options, the model's answer, and the truth
+— everything a control room needs to run the segment.
+
+## Out or Safe?
+
+A bang-bang play at first. The close-play calculator compares when the throw
+would arrive against when the runner did:
+
+$$\text{margin} = t_{\text{ball arrives}} - t_{\text{runner arrives}}$$
+
+Plays inside ±0.15 s are flagged `bang_bang` and are the only ones offered to
+the crowd.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-safevote
+#| eval: false
+out_or_safe(close_plays, max_margin_s = 0.15, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-safevote
+#| eval: false
+c08.out_or_safe(close_plays, top=10)
+```
+
+:::
+
+Ball arrival is derived from the measured throw velocity and the distance from
+the fielder to the bag; runner arrival is the frame he enters the bag radius.
+Both come from tracking, so the replay confirms the verdict.
+
+## Guess the Gun
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-gun
+#| eval: false
+guess_the_gun(pitches, min_velo = 90, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-gun
+#| eval: false
+c08.guess_the_gun(tabs["pitches"], top=10)
+```
+
+:::
+
+Options are generated as three 3-mph buckets straddling the true reading, so the
+guess is meaningfully hard but never unfair.
+
+## How Far Did It Go?
+
+Same idea in 25-foot buckets, offered on balls that carried at least 330 ft.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-far
+#| eval: false
+how_far_did_it_go(hits, min_distance = 330, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-far
+#| eval: false
+c08.how_far_did_it_go(tabs["hits"], top=10)
+```
+
+:::
+
+## Beat the Burner
+
+A fan taps their phone; the app races that reaction against a real runner. The
+target is how long the runner needed to cover 90 feet at his peak speed.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-beat
+#| eval: false
+beat_the_burner(sprints, baselines, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-beat
+#| eval: false
+c08.beat_the_burner(tabs["sprints"], baselines, top=10)
+```
+
+:::
+
+Each target carries its league percentile, so the crowd knows whether they are
+chasing an average runner or the fastest man in the league.
+
+## The night's slate
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-slate
+#| eval: false
+game_night_slate(catch_df, gun_df, far_df, burner_df, safe_df)
+```
+
+### Python
+
+```{python}
+#| label: py-slate
+#| eval: false
+c08.game_night_slate(catch_df, gun_df, far_df, burner_df, safe_df)
+```
+
+:::
+
+In the showcase game the engine found **33 plays** that qualified as genuine
+fan-vote moments — roughly one every half-inning, which is about the right
+cadence for in-game entertainment.

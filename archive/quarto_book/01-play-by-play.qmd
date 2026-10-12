@@ -1,0 +1,181 @@
+---
+title: "Component 1 — Tracking Data to Play-by-Play"
+---
+
+## Why this comes first
+
+The SMT dataset gives us base occupancy, but **not outs, not the count, and not
+the score**. Every situational metric in baseball — win probability, leverage,
+run expectancy — is a function of
+
+$$(\text{inning},\ \text{half},\ \text{outs},\ \text{base state},\ \text{score differential})$$
+
+so none of them can be computed until that state is recovered. Reconstructing it
+is the foundation of the whole project.
+
+## The method
+
+For each half-inning we walk the at-bats and apply an accounting identity.
+Everyone on base before the play, plus the batter, must finish in exactly one of
+three places — still on base, across the plate, or retired:
+
+$$|B| + 1 = |A| + \text{runs} + \text{outs}$$
+
+$|B|$ and $|A|$ come from `lineups`; whether the batter reached comes from the
+*next* at-bat's occupancy. The half-inning must total three outs, which closes
+the system.
+
+::: {.callout-important}
+## Three corrections that mattered
+
+Each was found by checking the output against real baseball rates, not by
+reading the code.
+
+1. **Do not count the batter twice.** The first version subtracted him from both
+   sides of the identity and produced a 31–28 final score.
+2. **Do not apply the identity to the last at-bat of a half-inning.** With no
+   observed "after" state, runners left on base are indistinguishable from runs,
+   so stranded runners were being counted as scoring.
+3. **Only the terminal play decides the outcome.** A foul ball shares event
+   code 4 with a live batted ball, so any walk that followed a foul was being
+   recorded as a single. Fixing this moved walks from 5.4 to 9.3 per game.
+:::
+
+A **physical plausibility constraint** then prevents phantom runs from
+substitutions: a runner on first cannot score on an infield out, and a retired
+batter cannot drive in a runner from first.
+
+## Implementation
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-pbp
+#| eval: false
+source("../R/smt_setup.R")
+source_smt_starter()
+source("../R/R01_play_by_play.R")
+
+pbp <- build_play_by_play("y1_d122_IOL_VAS")
+pbp_table(pbp, n = 12)
+```
+
+The core of the reconstruction — the accounting identity and the three
+corrections above:
+
+```{r}
+#| label: r-pbp-core
+#| eval: false
+# For each at-bat in a half-inning:
+before <- c(r$on_1b, r$on_2b, r$on_3b); before <- before[!is.na(before)]
+after  <- c(nxt$on_1b, nxt$on_2b, nxt$on_3b); after <- after[!is.na(after)]
+
+# Correction 2: the identity is NOT applied to the last at-bat.
+gone        <- if (is_last) 0L else max(0L, length(before) + 1L - length(after))
+batter_out  <- if (oc$dest == 0) 1L else 0L      # correction 1: count him once
+runner_gone <- max(0L, gone - batter_out)
+
+# Correction 3: only the terminal play decides the outcome.
+live <- is_live_contact(terminal_play_events(events_tbl, plays))
+
+# Physical plausibility: a runner on first cannot score on an infield out.
+cap  <- max_plausible_runs(rec$outcome, rec$on_1b, rec$on_2b, rec$on_3b)
+runs <- min(raw_runs, cap)
+```
+
+### Python
+
+```{python}
+#| label: py-pbp
+#| eval: false
+import sys; sys.path.insert(0, "..")
+from components import c01_play_by_play as c01
+
+pbp, summary = c01.play_by_play("y1_d122_IOL_VAS")
+c01.pbp_table(pbp, n=12)
+```
+
+```{python}
+#| label: py-pbp-core
+#| eval: false
+# smtstory/state/reconstruct.py — the same three corrections
+is_last     = nxt is None
+gone        = 0 if is_last else max(0, len(before) + 1 - len(after))
+batter_out  = 0 if oc.on_base else 1
+runner_gone = max(0, gone - batter_out)
+
+ball_in_play = is_live_contact(terminal_play_events(events, plays))
+
+cap = max_plausible_runs(rec["outcome"], rec["on_1b"], rec["on_2b"], rec["on_3b"])
+rec["runs"] = int(min(raw_runs, cap))
+```
+
+:::
+
+## Result
+
+A play-by-play table with full game state, one row per plate appearance:
+
+| inning | half | batter | outs | bases | outcome | runs | away | home |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Top | IOL-0596 | 0 | `___` | double | 0 | 0 | 0 |
+| 1 | Top | IOL-5057 | 0 | `_2_` | out | 0 | 0 | 0 |
+| 1 | Top | IOL-1285 | 1 | `_2_` | out | 0 | 0 | 0 |
+| 1 | Bottom | VAS-1487 | 0 | `___` | out | 0 | 0 | 0 |
+
+## Validation
+
+The reconstruction is judged against real baseball, across all 246 games:
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-validate
+#| eval: false
+season <- build_play_by_play_season(unique(game_info$game_string))
+season_validation(season)
+```
+
+### Python
+
+```{python}
+#| label: py-validate
+#| eval: false
+c01.season_validation()
+```
+
+:::
+
+| metric | reconstructed | real MiLB reference |
+|---|---|---|
+| runs per game | 10.12 | 9.5 |
+| hits per game | 19.72 | 18.0 |
+| walks per game | 8.64 | 7.0 |
+| home runs per game | 2.64 | 2.0 |
+| plate appearances per game | 76.56 | 76.0 |
+
+99.8 % of half-innings balance to exactly three outs; the 0.27 % that do not are
+flagged `state_anomaly` and quarantined from every downstream model.
+
+::: {.callout-note}
+## Known limitation
+
+Reaching on an error and a fielder's choice are not distinguishable from a
+single by occupancy alone, which is why hits run about 10 % high. Every at-bat
+carries a `confidence` flag, and downstream models filter on it.
+:::
+
+## An independent check
+
+Because the reconstruction infers runs rather than observing them, a second,
+physically independent estimate is worth having. `state/validate.R`/`.py`
+watches the 20 Hz player tracking and counts runners whose closest approach to
+home plate falls inside 8 feet.
+
+That detector is a **lower bound** — tracking stops at end-of-play, so runners
+who score after the whistle are missed — and it returns ~7.7 runs per game. The
+truth sits between the two estimates, close to the reconstruction's 10.1.

@@ -1,0 +1,214 @@
+---
+title: "Component 5 — Power & Hitting"
+---
+
+Five products: **Statcast Smash**, **Moonshot Meter**, **Barrel Zone**,
+**Launch Angle Rainbow**, and **Clutch Contact**.
+
+## Measuring a batted ball
+
+Three quantities come straight from the ball's flight after contact.
+
+| measurement | how |
+|---|---|
+| **Exit velocity** | high percentile of instantaneous 3-D ball speed in the 400 ms after contact |
+| **Launch angle** | the initial velocity vector over the first ~150 ms |
+| **Carry** | distance from home at the ball's **first bounce**, not its maximum distance |
+
+::: {.callout-important}
+## Why carry uses the first bounce
+
+The obvious approach — the ball's furthest point from home during the play — is
+wrong, and it inflated our first leaderboard to a 503-foot "home run". Relay
+throws move the ball further from home *after* it lands. Measuring at the first
+recorded bounce (or the point where a descending ball returns to contact height)
+dropped the season maximum to a believable 466.9 ft, with a 99th percentile of
+411.7 ft.
+:::
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-batted
+#| eval: false
+source("../R/R03_tracking_features.R")
+
+ball  <- get_ball_track("y1_d122_IOL_VAS", 246)
+ev    <- get_events("y1_d122_IOL_VAS", 246)
+t_hit <- event_time(ev, EVENT[["HIT_INTO_PLAY"]])
+
+exit_velocity(ball, t_hit)
+launch_angle(ball, t_hit)
+carry_distance(ball, t_hit)
+```
+
+### Python
+
+```{python}
+#| label: py-batted
+#| eval: false
+from components import c03_tracking_features as c03
+c03.batted_ball_measures(game, play=246)
+```
+
+:::
+
+## Statcast Smash
+
+Ranked by **90th-percentile** exit velocity rather than the single hardest ball,
+so the leaderboard rewards repeatable damage.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-smash
+#| eval: false
+source("../R/R05_power_hitting.R")
+statcast_smash(hits, lineups, min_balls = 5, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-smash
+#| eval: false
+from components import c05_power_hitting as c05
+c05.statcast_smash(tabs["hits"], lu, top=10)
+```
+
+:::
+
+| player | max EV | 90th-pct EV | balls |
+|---|---|---|---|
+| NYN-2545 | 121.8 | **121.6** | 7 |
+| JGO-5337 | 121.7 | 121.5 | 5 |
+| VNG-5259 | 121.8 | 121.1 | 8 |
+| ADQ-3824 | **122.0** | 119.4 | 14 |
+
+![Exit velocity distribution](../outputs/figures/fig_exit_velo_dist.png)
+
+## Moonshot Meter
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-moonshot
+#| eval: false
+moonshot_meter(hits, lineups, min_flies = 3, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-moonshot
+#| eval: false
+c05.moonshot_meter(tabs["hits"], lu, top=10)
+```
+
+:::
+
+| player | longest (ft) | flies |
+|---|---|---|
+| ANI-3369 | **466.9** | 36 |
+| ANI-3725 | 464.9 | 76 |
+| ANI-2596 | 460.8 | 47 |
+
+## Barrel Zone
+
+A *barrel* is the sweet-spot combination: exit velocity ≥ 95 mph with a launch
+angle between 20° and 35°.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-barrel
+#| eval: false
+barrel_zone(hits, lineups, min_balls = 8, top = 10)
+plot_barrel_zone(hits)
+```
+
+### Python
+
+```{python}
+#| label: py-barrel
+#| eval: false
+c05.barrel_zone(tabs["hits"], lu, top=10)
+```
+
+:::
+
+| player | barrels | balls | barrel rate |
+|---|---|---|---|
+| ARN-8132 | 18 | 177 | 10.2 % |
+| PHD-2671 | 16 | 120 | **13.3 %** |
+| ANI-3725 | 15 | 132 | 11.4 % |
+
+## Launch Angle Rainbow
+
+The visual that explains *why* launch angle matters: the same exit velocity
+produces a groundout at 5° and a home run at 28°.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-rainbow
+#| eval: false
+rainbow <- launch_angle_rainbow(hits, lineups, player = "ANI-3725")
+rainbow$summary
+plot_launch_rainbow(rainbow)
+```
+
+### Python
+
+```{python}
+#| label: py-rainbow
+#| eval: false
+data, summary = c05.launch_angle_rainbow(tabs["hits"], lu, player="ANI-3725")
+summary
+```
+
+:::
+
+Batted balls are bucketed the way broadcasters describe them — ground ball
+(< 10°), line drive (10–25°), fly ball (25–50°), pop up (> 50°).
+
+## Clutch Contact
+
+Exit velocity is only half the story; *when* it happened is the other half. This
+weights contact quality by the leverage of the moment:
+
+$$\text{clutch contact} = \frac{EV}{100}\times\sqrt{LI}$$
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-clutch
+#| eval: false
+clutch_contact(pbp, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-clutch
+#| eval: false
+c05.clutch_contact(enriched, top=10)
+```
+
+:::
+
+The square root keeps a single enormous-leverage plate appearance from dwarfing
+everything else on the leaderboard — the same compression used by the Clutch
+Score in Component 2.

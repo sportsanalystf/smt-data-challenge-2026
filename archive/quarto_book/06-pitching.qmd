@@ -1,0 +1,198 @@
+---
+title: "Component 6 — Pitching"
+---
+
+Four products: **Radar Gun Live**, **Velocity Heartbeat**, **Effective
+Velocity**, and **Late Life**.
+
+::: {.callout-warning}
+## Scope: no spin rate
+
+Spin is not in the SMT data and cannot be recovered from positional tracking
+alone. Rather than invent it, this component uses three things that *are*
+directly measurable: **release extension**, **movement** (with gravity removed),
+and **perceived velocity**.
+:::
+
+## Fitting a pitch
+
+Each pitch has 10–12 tracked frames between release (y ≈ 55 ft) and the plate.
+We fit **quadratics** to $x(y)$ and $z(y)$ — exactly right, because under
+constant acceleration position is quadratic in flight distance. Fitting lets us
+evaluate the pitch at *any* distance, which is what tunneling requires.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-fit
+#| eval: false
+traj <- fit_pitch_trajectory(get_ball_track(gs, play), t_pitch)
+traj$extension_ft   # 60.5 - release_y
+pitch_at_distance(traj, COMMIT_POINT_FT)   # where it was at the commit point
+```
+
+### Python
+
+```{python}
+#| label: py-fit
+#| eval: false
+from smtstory.analytics.tunneling import fit_trajectory, at_distance, COMMIT_POINT_FT
+traj = fit_trajectory(ball, t_pitch)
+at_distance(traj, COMMIT_POINT_FT)
+```
+
+:::
+
+## Radar Gun Live
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-radar
+#| eval: false
+source("../R/R06_pitching.R")
+radar_gun(pitches, lineups, min_pitches = 30, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-radar
+#| eval: false
+from components import c06_pitching as c06
+c06.radar_gun(tabs["pitches"], lu, top=10)
+```
+
+:::
+
+| player | max | avg | pitches |
+|---|---|---|---|
+| KVN-7249 | 103.0 | 88.6 | 48 |
+| ANI-1551 | 103.0 | **89.7** | 379 |
+| VAS-0317 | 103.0 | 82.5 | 746 |
+
+::: {.callout-note}
+Readings above **103 mph** are filtered as single-frame tracking spikes — the
+raw data contains a 193 mph artifact that would otherwise poison both the
+leaderboard and every percentile built from it.
+:::
+
+![Pitch velocity distribution](../outputs/figures/fig_pitch_velo_dist.png)
+
+## Velocity Heartbeat
+
+Does a starter hold his gas? Per-pitch velocity with a rolling average, and the
+difference between his first ten pitches and his last ten.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-heartbeat
+#| eval: false
+hb <- velocity_heartbeat(pitches, "y1_d122_IOL_VAS")
+hb$summary
+plot_velocity_heartbeat(hb)
+```
+
+### Python
+
+```{python}
+#| label: py-heartbeat
+#| eval: false
+data, summary = c06.velocity_heartbeat(tabs["pitches"], lu, "y1_d122_IOL_VAS")
+summary
+```
+
+:::
+
+## Effective Velocity
+
+A pitcher who releases the ball a foot closer to the plate shortens the flight
+and steals reaction time, so the ball **plays faster than the gun says**:
+
+$$EV_{\text{eff}} = v \times \frac{60.5 - \text{ext}_{\text{league}}}{60.5 - \text{ext}_{\text{actual}}}$$
+
+Extension is measured directly — in one sampled at-bat it ranged from 3.3 to
+8.9 ft between pitchers, which is worth several perceived mph.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-effvelo
+#| eval: false
+effective_velocity_table(gs, plays, velos, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-effvelo
+#| eval: false
+c06.effective_velocity_table(game, plays, velos, top=10)
+```
+
+:::
+
+## Late Life
+
+::: {.callout-important}
+## Gravity is not movement
+
+Deviation from the straight line a hitter naively extrapolates has two causes,
+and only one is interesting. **Gravity drops a 90 mph pitch about 39 inches** —
+reporting that as "movement" makes every pitch look filthy and tells a fan
+nothing.
+
+Our first implementation did exactly that and produced 22–46 inch "breaks" on
+every pitch in an at-bat. Subtracting the gravity component
+($\tfrac{1}{2}gt^2$, with $t$ from velocity and release distance) leaves
+**induced** vertical break — the aerodynamic part — which separates pitch types
+cleanly:
+
+| velo | extension | induced VB | horizontal | flight | shape |
+|---|---|---|---|---|---|
+| 91.9 | 5.67 ft | **+19.3 in** | −13.6 in | 0.437 s | riding fastball |
+| 77.7 | 6.82 ft | **+4.1 in** | −4.9 in | 0.507 s | breaking ball |
+:::
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-latelife
+#| eval: false
+late_break_in <- function(traj, velo_mph = NA_real_) {
+  # ... straight-line baseline from the release direction ...
+  t <- flight_time_s(ry, velo_mph)
+  gravity_drop_in <- 0.5 * GRAVITY_FT_S2 * t^2 * 12
+  induced_in <- raw_vert_in + gravity_drop_in   # remove gravity
+  list(horizontal_in = horiz_in, induced_vertical_in = induced_in,
+       gravity_drop_in = gravity_drop_in)
+}
+
+ll <- late_life_table(gs, plays, velos, top = 10)
+plot_pitch_movement(ll)
+```
+
+### Python
+
+```{python}
+#| label: py-latelife
+#| eval: false
+c06.late_life_table(game, plays, velos, top=10)
+```
+
+:::
+
+The movement plot — horizontal against induced vertical break — is the standard
+"pitch shape" view, and it is what lets a scoreboard say *that was a different
+pitch* and have the graphic prove it.

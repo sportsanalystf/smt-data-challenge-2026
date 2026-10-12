@@ -1,0 +1,21 @@
+# data stays out of the repository
+data/
+*.parquet
+*.rds
+*.duckdb
+# local and generated files
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.venv/
+venv/
+.env
+.DS_Store
+*.log
+cache/
+outputs/R/
+outputs/engine/
+outputs/feat/
+outputs/features/
+~$*

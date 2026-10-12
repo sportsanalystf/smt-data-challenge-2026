@@ -1,0 +1,148 @@
+---
+title: "Component 3 — Watching the Play"
+---
+
+## Why animation is the point
+
+A number tells a fan *what* happened. An animation shows them *why it was hard*.
+The scoreboard's job is both, and the analysis has to change depending on how
+the play ended:
+
+| If the at-bat ended in… | What is worth showing |
+|---|---|
+| a **strikeout** | the pitch sequence — nothing happened on the field, but the pitcher just won a duel |
+| a **ground out** | the fielder's route, transfer and throw, and the race to first |
+| a **fly out** | route distance, hang time, closing speed, catch odds |
+| a **base hit** | where it landed, who had a chance, how fast the runner went |
+
+## Building the frames
+
+Player and ball tracking are combined into one long table with a `type` column,
+timestamps are snapped to the stadium's true frame interval, and a `frame_id` is
+created for the animation to transition over.
+
+::: {.callout-note}
+## Frame rate is derived, not assumed
+
+Different stadiums feed at different rates. Both implementations take the modal
+gap between consecutive samples for a player rather than hard-coding 20 Hz —
+the same approach the organizers' own `animate_play()` uses.
+:::
+
+::: {.panel-tabset}
+
+### R
+
+R uses **gganimate** on a **sportyR** field, extending the starter's
+`animate_play()` rather than replacing it.
+
+```{r}
+#| label: r-anim
+#| eval: false
+source("../R/R10_animation.R")
+
+# The starter's animation, plus the story of the play
+anim <- animate_play_annotated(
+  game_string = "y1_d122_IOL_VAS",
+  play        = 246,
+  pbp_row     = dplyr::filter(pbp, last_play == 246)
+)
+save_animation(anim, "../outputs/animations/r_turning_point.gif")
+```
+
+The ball's marker is scaled by height so a fly ball reads as airborne:
+
+```{r}
+#| label: r-anim-ball
+#| eval: false
+ggplot2::geom_point(
+  data = dplyr::filter(trk, type == "ball"),
+  ggplot2::aes(x = position_x, y = position_y, size = position_z),
+  fill = "white", shape = 21, show.legend = FALSE) +
+  ggplot2::scale_size_continuous(range = c(2, 6))
+```
+
+### Python
+
+Python uses `matplotlib.animation` and writes the same GIF.
+
+```{python}
+#| label: py-anim
+#| eval: false
+import sys; sys.path.insert(0, "..")
+from smtstory import dataio
+from components import c10_animation as anim
+
+game = dataio.load_game(dataio.game_dir_from_string("y1_d122_IOL_VAS"),
+                        with_player_tracking=True)
+
+anim.animate_play(
+    game, play=246,
+    out_path="../outputs/animations/play_turning_point.gif",
+    title="THE TURNING POINT",
+    subtitle="VAS-5976 — home run — WPA +83%")
+```
+
+```{python}
+#| label: py-anim-ball
+#| eval: false
+# Marker area grows with height, but the growth is CAPPED — an uncapped scale
+# turns a towering popup into a circle that swallows the infield.
+ball_dot.set_sizes([45 + 9 * float(np.clip(bz[i], 0, 14))])
+```
+
+:::
+
+## The rendered animations
+
+Both implementations produce standalone GIFs that embed in this book, in a Word
+paper, or in a scoreboard playlist.
+
+### The turning point
+
+The biggest swing of the game — a three-run homer in the bottom of the 11th.
+
+![Turning point: WPA +83%](../outputs/animations/play_turning_point.gif)
+
+### A defensive play
+
+Ball flight, fielder routes and the catch, with the difficulty attached.
+
+![Web gem](../outputs/animations/play_web_gem.gif)
+
+### The pitch sequence
+
+For a strikeout the field is empty, so the story lives in the sequence. Each
+pitch appears where it crossed the plate, from the catcher's angle, with
+velocity and induced break.
+
+![Pitch sequence on a strikeout](../outputs/animations/pitch_sequence_strikeout.gif)
+
+## Rendering everything
+
+```bash
+python pipeline/build_animations.py
+```
+
+| animation | size |
+|---|---|
+| `play_turning_point.gif` | 587 KB |
+| `play_web_gem.gif` | 383 KB |
+| `pitch_sequence_strikeout.gif` | 29 KB |
+| `play_strikeout.gif` | 60 KB |
+
+## Design decisions worth recording
+
+::: {.callout-important}
+## Two bugs the first render exposed
+
+1. **The ball swallowed the infield.** Marker area scaled linearly with height
+   with no cap, so a towering popup drew a circle wider than the basepaths. The
+   scale is now clamped at 14 feet.
+2. **The subtitle sat on top of the title.** With an equal-aspect field the axes
+   box moves, so axis-anchored text collided. Titles are now anchored to the
+   *figure*, not the axes.
+
+Both were only visible by rendering a frame and looking at it — which is the
+argument for always rendering a frame and looking at it.
+:::

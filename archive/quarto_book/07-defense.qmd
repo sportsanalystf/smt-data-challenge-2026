@@ -1,0 +1,243 @@
+---
+title: "Component 7 — Defense & Fielding"
+---
+
+Six products, anchored by the flagship: **The Robbery Meter**, **Outfield
+Cannons**, **Ground Crew Range**, **Web Gem of the Game**, **Double-Play
+Ballet**, and **Pop-Time Pipeline**.
+
+## The Robbery Meter
+
+The most electric moment in baseball — an outfielder running down a ball that
+should have dropped — had no number on the scoreboard. This gives it one.
+
+Three physically meaningful features, engineered from tracking:
+
+| feature | meaning |
+|---|---|
+| `route_ft` | straight-line distance from where the fielder stood at contact to the ball |
+| `hang_s` | time from contact to the catch or landing |
+| `req_speed` | `route_ft / hang_s` — the speed he would have to sustain to arrive |
+
+Route and hang are the physics; **their ratio is what separates a routine fly
+from a highlight**.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-catch
+#| eval: false
+source("../R/R07_defense.R")
+
+fit <- fit_catch_model(catches)     # glm(catch_made ~ route_ft + hang_s + req_speed)
+catch_model_metrics(fit)
+plot_catch_model(fit)
+```
+
+### Python
+
+```{python}
+#| label: py-catch
+#| eval: false
+from components import c07_defense as c07
+model = c07.fit_catch_model(tabs["catches"])
+c07.catch_model_metrics(model)
+```
+
+:::
+
+| metric | value |
+|---|---|
+| opportunities | **7,058** |
+| base catch rate | 0.850 |
+| accuracy | **0.955** |
+| AUC | **0.954** |
+| Brier score | 0.038 |
+
+![The catch probability model](../outputs/figures/fig_catch_probability_model.png)
+
+The curve reads exactly as intuition demands: a 60-foot route is nearly
+automatic with five seconds of hang time and close to a coin flip with three.
+
+## Outs Above Expected
+
+Summing `catch made − catch probability` over every chance gives each fielder
+the outs they recorded **beyond what an average defender would have**, given the
+same opportunities.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-oae
+#| eval: false
+scored <- score_catches(fit)
+outs_above_expected(scored, lineups, min_opps = 12, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-oae
+#| eval: false
+c07.outs_above_expected(tabs["catches"], model, lu, top=10)
+```
+
+:::
+
+| player | pos | opportunities | made | OAE |
+|---|---|---|---|---|
+| PHD-5994 | LF | 254 | 223 | **+8.75** |
+| PHD-8619 | LF | 279 | 261 | +5.79 |
+| PHD-8007 | CF | 70 | 68 | +4.64 |
+
+![Outs Above Expected](../outputs/figures/fig_oae_leaderboard.png)
+
+## Web Gem of the Game
+
+Every completed catch carries a **Robbery Score** of
+$100 \times (1 - P(\text{catch}))$. Sorting by it surfaces the night's most
+improbable play automatically — no producer required.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-gem
+#| eval: false
+web_gem(scored, lineups, top = 5)
+```
+
+### Python
+
+```{python}
+#| label: py-gem
+#| eval: false
+c07.web_gem(tabs["catches"], model, lu, top=5)
+```
+
+:::
+
+| player | pos | route | hang | catch prob | robbery score |
+|---|---|---|---|---|---|
+| ZGC-9675 | RF | 139.8 ft | 6.45 s | 0.165 | **83.5** |
+| ARN-3382 | LF | 137.9 ft | 6.55 s | 0.214 | 78.6 |
+
+![The season's best web gem](../outputs/figures/fig_webgem_hero.png)
+
+## Outfield Cannons
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-cannons
+#| eval: false
+outfield_cannons(throws, lineups, min_throws = 3, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-cannons
+#| eval: false
+c07.outfield_cannons(tabs["throws"], lu, top=10)
+```
+
+:::
+
+Hardest measured throw: **102 mph**. League average is 66.6 mph across 8,553
+tracked throws, so the leaderboard is genuinely separating arms.
+
+::: {.callout-note}
+## A join bug worth recording
+
+The fielder lookup joins `fielder_id` to a lineup column. The lineup table can
+carry more than one row per play, and the first version of this join silently
+returned two rows per fielding play — doubling every leaderboard built from it.
+Both implementations now de-duplicate on `(game_string, play_per_game)` first.
+:::
+
+## Ground Crew Range
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-range
+#| eval: false
+ground_crew_range(catches, lineups, min_catches = 8, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-range
+#| eval: false
+c07.ground_crew_range(tabs["catches"], lu, top=10)
+```
+
+:::
+
+| player | pos | avg route | top closing | catches |
+|---|---|---|---|---|
+| XOZ-5625 | CF | **83.0 ft** | 19.8 mph | 11 |
+| QBR-1229 | CF | 77.7 ft | 17.8 mph | 12 |
+
+## Double-Play Ballet
+
+Pivot time — glove to release for the middle infielder on the turn.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-dp
+#| eval: false
+double_play_ballet("y1_d122_IOL_VAS", plays, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-dp
+#| eval: false
+c07.double_play_ballet(game, plays, top=10)
+```
+
+:::
+
+## Pop-Time Pipeline
+
+Catcher exchange time and throw velocity to second base, measured from the
+event stream and the ball's flight.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-pop
+#| eval: false
+pop_time_pipeline("y1_d122_IOL_VAS", plays, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-pop
+#| eval: false
+c07.pop_time_pipeline(game, plays, top=10)
+```
+
+:::
+
+Across the showcase game, transfers averaged **1.25 s** with throws up to
+91 mph — the raw material for a "can he throw him out?" graphic.

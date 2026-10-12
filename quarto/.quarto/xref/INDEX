@@ -1,0 +1,32 @@
+{
+  "index.qmd": {
+    "index.html": "09bdc1a5"
+  },
+  "01-play-by-play.qmd": {
+    "01-play-by-play.html": "583f8d89"
+  },
+  "02-wpa-leverage.qmd": {
+    "02-wpa-leverage.html": "4b490ca2"
+  },
+  "03-animation.qmd": {
+    "03-animation.html": "eeb207f9"
+  },
+  "04-speed-baserunning.qmd": {
+    "04-speed-baserunning.html": "896c0778"
+  },
+  "05-power-hitting.qmd": {
+    "05-power-hitting.html": "b339a172"
+  },
+  "06-pitching.qmd": {
+    "06-pitching.html": "67acc372"
+  },
+  "07-defense.qmd": {
+    "07-defense.html": "1451d921"
+  },
+  "08-fan-interactive.qmd": {
+    "08-fan-interactive.html": "ec807bb4"
+  },
+  "09-composite-storytelling.qmd": {
+    "09-composite-storytelling.html": "4de43b41"
+  }
+}

@@ -1,0 +1,2757 @@
+---
+title: 'On the Big Screen!'
+subtitle: 'SMT Data Challenge 2026'
+author: "Faizan Khan"
+date: "`r format(Sys.Date(), '%m/%d/%y')`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: false
+    embed-resources: true
+    fig-width: 9
+    fig-height: 4.5
+---
+
+```{r set options, include=FALSE}
+# DO NOT CHANGE THE LINE BELOW
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+``` {css styling, echo=FALSE}
+
+<style>
+.red-header {
+  color: #c8102e;
+}
+</style>
+
+<style>
+.metric-note {
+  background: #f5f7fa;
+  border-left: 4px solid #3d8bff;
+  padding: 8px 12px;
+  margin: 10px 0;
+  font-size: 0.92em;
+}
+</style>
+
+```
+
+<h1 class="red-header">Headline Results</h1>
+
+## The problem
+
+A Minor League scoreboard has about seven seconds of a fan's attention. The
+question this project answers is: **which seven seconds, and why?**
+
+## Key findings
+
+**Finding 1:** The SMT data has base occupancy but **no outs, no count and no
+score**. Everything situational has to be rebuilt first. The reconstruction
+lands at **9.9 runs and 19.4 hits per game** against real Minor League rates of
+~9.5 and ~18, with **99.8%** of half-innings balancing to exactly three outs.
+
+**Finding 2:** Win probability fits at **77.9% accuracy** (Brier 0.141) and
+Leverage Index normalises to a mean of exactly **1.00**, with a season maximum
+of **7.9**. The largest swings the model finds are walk-off home runs — it was
+never told what a walk-off is.
+
+**Finding 3:** The single most improbable catch of the season was a right
+fielder who covered **139.8 feet in 6.45 seconds** on a ball with a **16.5%**
+catch probability.
+
+**Finding 4:** Gravity is not movement. Measuring pitch break naively gives
+22–46 inches on *every* pitch because gravity alone drops a 90 mph fastball ~39
+inches. Removing it separates a riding fastball (**+19 in** induced) from a
+breaking ball (**+4 in**).
+
+**Finding 5:** The fastest runner in the league topped **22.8 mph**, the hardest
+contact was **122 mph**, the longest carry **467 feet** and the hardest throw
+**102 mph** — all measured directly from 20 Hz tracking.
+
+# Setup and Data
+
+```{r load-data}
+library(tidyverse)
+library(arrow)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(jsonlite)
+
+# Point this at the folder holding ball-events/, ball-positions/, etc.
+data_dir <- Sys.getenv("SMT_DATA_ROOT", unset = "..")
+
+# The tracking tables are far too large to read into memory, so they are opened
+# as Arrow datasets and filtered before collecting. Only lineups and game_info
+# are small enough to pull in whole.
+na_vals <- c("", "NA", "NULL", NA, "\\N")
+
+ball_positions <- open_csv_dataset(
+  file.path(data_dir, "ball-positions"),
+  partitioning = c("home_team", "away_team", "year", "day"),
+  col_names = c("game_string", "play_per_game", "timestamp",
+                "ball_position_x", "ball_position_y", "ball_position_z"),
+  hive_style = FALSE, unify_schemas = TRUE, na = na_vals)
+
+ball_events <- open_csv_dataset(
+  file.path(data_dir, "ball-events"),
+  partitioning = c("home_team", "away_team", "year", "day"),
+  hive_style = FALSE, unify_schemas = TRUE, na = na_vals)
+
+player_positions <- open_csv_dataset(
+  file.path(data_dir, "player-positions"),
+  partitioning = c("home_team", "away_team", "year", "day"),
+  col_names = c("game_string", "play_per_game", "timestamp",
+                "player_id", "field_x", "field_y"),
+  hive_style = FALSE, unify_schemas = TRUE, na = na_vals)
+
+lineups   <- open_csv_dataset(file.path(data_dir, "lineups.csv"),
+                              hive_style = FALSE, na = na_vals) %>% collect()
+game_info <- open_csv_dataset(file.path(data_dir, "game-info.csv"),
+                              hive_style = FALSE, na = na_vals) %>% collect()
+
+all_games <- sort(unique(game_info$game_string))
+```
+
+```{r how-much-data}
+
+# ---- HOW MUCH DATA TO PROCESS --------------------------------------------
+# Two knobs, because the two passes cost very different amounts.
+#
+#   N_MODEL_GAMES  reads ball-events + lineups only. Fast (~0.4 s/game), and
+#                  the win-probability model wants a decent sample.
+#   N_TRACK_GAMES  reads player-positions, which is a 4.5 GB directory.
+#                  Budget ~10 s per game.
+#
+# Start small, confirm the document renders, then raise them.
+#   quick check :  1 /  25   (about a minute)
+#   working     : 25 / 250   (a few minutes)
+#   full season : 250 / 250  (about 40 minutes, then cached)
+
+N_TRACK_GAMES <- 1
+N_MODEL_GAMES <- 25
+
+# The tracked games must be a subset of the modelled ones so the joins line up
+model_games <- head(all_games, N_MODEL_GAMES)
+track_games <- head(model_games, N_TRACK_GAMES)
+
+# Leaderboard minimums are written for a full season. On a small sample they
+# would filter every table down to nothing, so scale them to the sample.
+scale_min <- function(full_season_min) {
+  max(1L, as.integer(round(full_season_min * length(track_games) / 250)))
+}
+
+cat("Modelling", length(model_games), "games |",
+    "extracting tracking for", length(track_games), "\n")
+```
+
+```{r constants}
+
+# Conversions and field geometry used throughout
+MPH          <- 0.681818        # 1 ft/s in mph
+OUTS_PER_HALF <- 3L
+RUBBER_FT    <- 60.5            # rubber to the back of the plate
+COMMIT_FT    <- 23.8            # where a hitter must commit (~175 ms out)
+GRAVITY      <- 32.174
+DRAG_FACTOR  <- 0.93            # a pitch loses ~8% of its speed on the way in
+
+# Base bag centres, 90 ft basepaths rotated 45 degrees
+BASES <- list(home = c(0, 0), first = c(63.64, 63.64),
+              second = c(0, 127.28), third = c(-63.64, 63.64))
+
+# player_id lookup from the data dictionary
+POS <- c("1" = "P", "2" = "C", "3" = "1B", "4" = "2B", "5" = "3B", "6" = "SS",
+         "7" = "LF", "8" = "CF", "9" = "RF", "10" = "BAT",
+         "11" = "R1", "12" = "R2", "13" = "R3")
+
+# ball_eventcode lookup
+EV <- c(PITCH = 1, ACQUIRED = 2, THROW = 3, HIT = 4, END = 5, PICKOFF = 6,
+        ACQUIRED_UNK = 7, THROW_UNK = 8, DEFLECT = 9, WALL = 10,
+        HOMERUN = 11, BOUNCE = 16)
+
+# Codes meaning the ball stayed live after contact. A foul shares code 4 with a
+# live batted ball, so this set is the only way to tell them apart.
+LIVE_CODES <- unname(EV[c("ACQUIRED", "THROW", "ACQUIRED_UNK", "THROW_UNK",
+                          "DEFLECT", "WALL", "BOUNCE")])
+
+BASE_LABELS <- c("___", "1__", "_2_", "12_", "__3", "1_3", "_23", "123")
+
+# Plot colours reused across the document
+BLUE <- "#3d8bff"; GOLD <- "#f5c518"; GREEN <- "#21d07a"; RED <- "#c8102e"
+```
+
+```{r helpers}
+
+# Small cache helper -- the first run is slow, re-renders are instant
+cache_dir <- "cache"
+dir.create(cache_dir, showWarnings = FALSE)
+
+cached <- function(name, expr) {
+  path <- file.path(cache_dir, paste0(name, ".rds"))
+  if (file.exists(path)) return(readRDS(path))
+  value <- force(expr)
+  saveRDS(value, path)
+  value
+}
+
+# Print a table, or a short note when the sample produced nothing. A small
+# sample legitimately contains no double plays or throws to second, and an
+# empty table reads better than a row of Inf.
+kbl_or_note <- function(df, caption,
+                        note = "No qualifying plays in this sample.") {
+  if (nrow(df) == 0) {
+    return(knitr::asis_output(paste0("*", note, "*")))
+  }
+  df %>%
+    kbl(caption = caption) %>%
+    kable_styling(bootstrap_options = c("striped", "condensed"),
+                  full_width = FALSE)
+}
+```
+
+# Exploratory Data Analysis
+
+## The event stream
+
+```{r}
+
+# What kinds of events are recorded, and how often?
+sample_games <- head(model_games, 12)
+
+ev_sample <- ball_events %>%
+  filter(game_string %in% sample_games) %>%
+  collect() %>%
+  mutate(across(c(play_per_game, timestamp, player_id, ball_eventcode),
+                as.numeric))
+
+ev_labels <- c("1" = "Pitch", "2" = "Ball acquired", "3" = "Throw",
+               "4" = "Hit into play", "5" = "End of play", "6" = "Pickoff",
+               "9" = "Deflection", "10" = "Off the wall", "11" = "Home run",
+               "16" = "Bounce")
+
+ev_sample %>%
+  filter(ball_eventcode %in% as.numeric(names(ev_labels))) %>%
+  count(ball_eventcode) %>%
+  mutate(event = ev_labels[as.character(ball_eventcode)],
+         per_game = n / length(sample_games)) %>%
+  ggplot(aes(x = reorder(event, per_game), y = per_game)) +
+  geom_col(fill = BLUE, alpha = 0.85) +
+  geom_text(aes(label = round(per_game)), hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Events recorded per game",
+       x = NULL, y = "Events per game") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+Roughly 300 pitches per game, ~110 balls hit into play (most of them fouls), and
+one "end of play" marker per live ball. The pitch and end-of-play counts are what
+let us split a game into plate appearances.
+
+## Ball tracking
+
+```{r}
+
+# How many frames does a single play get, and at what rate?
+ball_sample <- ball_positions %>%
+  filter(game_string == model_games[1]) %>%
+  collect() %>%
+  mutate(across(everything(), as.numeric))
+
+frame_gaps <- ball_sample %>%
+  arrange(play_per_game, timestamp) %>%
+  group_by(play_per_game) %>%
+  mutate(gap = timestamp - lag(timestamp)) %>%
+  ungroup() %>%
+  filter(!is.na(gap), gap > 0, gap < 500)
+
+sample_rate <- 1000 / median(frame_gaps$gap)
+
+ggplot(frame_gaps, aes(gap)) +
+  geom_histogram(binwidth = 5, fill = GREEN, alpha = 0.85) +
+  labs(title = paste0("Tracking is sampled at ", round(sample_rate), " Hz"),
+       x = "Milliseconds between frames", y = "Frames") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+Every 50 ms, so **20 frames per second**. That is the resolution behind every
+speed, distance and angle in this project — a runner covering 30 ft/s moves
+1.5 feet between frames.
+
+## Player tracking coverage
+
+```{r}
+
+# Which players are tracked, and for how much of a play?
+pl_sample <- player_positions %>%
+  filter(game_string == model_games[1], play_per_game <= 40) %>%
+  collect() %>%
+  mutate(across(everything(), as.numeric))
+
+pl_sample %>%
+  filter(player_id <= 13) %>%
+  count(player_id) %>%
+  mutate(role = POS[as.character(player_id)]) %>%
+  ggplot(aes(x = reorder(role, player_id), y = n)) +
+  geom_col(fill = GOLD, alpha = 0.9) +
+  labs(title = "Frames captured per tracked role (first 40 plays)",
+       x = NULL, y = "Frames") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+All nine fielders plus the batter are tracked on every play. Runners only appear
+when they are on base, which is exactly the signal used to reconstruct the base
+state.
+
+# Part 1 — From Tracking to Play-by-Play
+
+## Step 1 — What is missing
+
+**PROBLEM:** The `lineups` table tells us who is on each base, but nothing
+records **outs**, **the count** or **the score**. Win Probability Added and
+Leverage Index are functions of
+
+$$(\text{inning},\ \text{half},\ \text{outs},\ \text{base state},\ \text{score differential})$$
+
+so none of them exist until that state is rebuilt. This is the foundation of
+everything downstream.
+
+```{r}
+
+# Look at one half-inning: occupancy is there, outs and score are not
+lineups %>%
+  filter(game_string == model_games[1], inning == 1, half_inning == "Bottom") %>%
+  select(at_bat, play_per_game, batter, on_1b, on_2b, on_3b) %>%
+  head(8) %>%
+  kbl_or_note("Base occupancy is recorded; outs and score are not")
+```
+
+## Step 2 — Deciding what happened in each at-bat
+
+Two independent signals tell us the outcome. **Occupancy** says where the batter
+ended up: if he appears on second base at the next at-bat, he doubled. **The
+event stream** says how: whether the ball was actually put in play.
+
+The subtle part is that a foul ball and a live batted ball share event code 4.
+An at-bat that ends in a walk usually contains a foul somewhere, so checking
+"was there a code 4" would call that walk a single. Only the **last** play of the
+at-bat decides the outcome, and a live ball is one that somebody subsequently
+fields.
+
+```{r}
+
+# TRUE only if the final play was a batted ball that stayed live
+is_live_contact <- function(codes) {
+  if (length(codes) == 0)             return(FALSE)
+  if (EV[["HOMERUN"]] %in% codes)     return(TRUE)
+  if (!(EV[["HIT"]] %in% codes))      return(FALSE)
+
+  # everything recorded after contact -- a foul has nothing after it
+  after_hit <- codes[-seq_len(which(codes == EV[["HIT"]])[1])]
+  any(after_hit %in% LIVE_CODES)
+}
+
+# Quick check on the two cases that matter
+foul <- c(EV[["HIT"]], EV[["END"]])                    # contact, then dead
+live <- c(EV[["HIT"]], EV[["BOUNCE"]], EV[["ACQUIRED"]])  # contact, then fielded
+
+c(foul = is_live_contact(foul), live = is_live_contact(live))
+```
+
+## Step 3 — Balancing the half-inning
+
+**METHOD:** For each half-inning, walk the at-bats and apply an accounting
+identity. Everyone on base before the play, plus the batter, has to finish in
+exactly one of three places — still on base, across the plate, or retired:
+
+$$|B| + 1 = |A| + \text{runs} + \text{outs}$$
+
+$|B|$ and $|A|$ come from the lineup table. The half-inning must total three
+outs, which closes the system.
+
+Two traps, both of which I hit:
+
+1. **The last at-bat of a half-inning has no observed "after" state.** Runners
+   left on base then look identical to runs. Applying the identity there scored
+   every stranded runner, so it is skipped and the remaining outs are assigned.
+2. **Substitutions look like runs.** A pinch-runner replaces a player code, and
+   the original vanishes. Baseball physics bounds this: a runner on first cannot
+   score on an infield out.
+
+```{r}
+
+# Ceiling on how many runners can score, given what the batter did
+max_runs_possible <- function(outcome, on1, on2, on3) {
+  n1 <- as.integer(!is.na(on1))
+  n2 <- as.integer(!is.na(on2))
+  n3 <- as.integer(!is.na(on3))
+
+  switch(outcome,
+         "home_run" = n1 + n2 + n3 + 1L,   # everyone scores
+         "triple"   = n1 + n2 + n3,
+         "double"   = n1 + n2 + n3,        # first can score on one in the gap
+         "single"   = n2 + n3,             # first almost never scores
+         "walk_hbp" = if (n1 && n2 && n3) 1L else 0L,   # forced run only
+         "out"      = n3,                  # sac fly or run-scoring groundout
+         n1 + n2 + n3)
+}
+
+# Bases empty, batter out -- nobody can score
+max_runs_possible("out", NA, NA, NA)
+```
+
+## Step 4 — Running the reconstruction
+
+```{r}
+
+# Encode base occupancy as 0-7
+base_code <- function(on1, on2, on3) {
+  as.integer(!is.na(on1)) + 2L * as.integer(!is.na(on2)) + 4L * as.integer(!is.na(on3))
+}
+
+# Readable version of the situation, for the scoreboard copy
+describe_state <- function(code, outs) {
+  on1 <- bitwAnd(code, 1L) > 0
+  on2 <- bitwAnd(code, 2L) > 0
+  on3 <- bitwAnd(code, 4L) > 0
+
+  bases <- case_when(
+    !on1 & !on2 & !on3 ~ "bases empty",
+    on1 & on2 & on3    ~ "bases loaded",
+    on1 & on3          ~ "runners on the corners",
+    on1 & on2          ~ "runners on first and second",
+    on2 & on3          ~ "runners on second and third",
+    on1                ~ "a runner on first",
+    on2                ~ "a runner on second",
+    TRUE               ~ "a runner on third")
+
+  paste0(bases, ", ", case_when(outs == 0 ~ "nobody out",
+                                outs == 1 ~ "one out",
+                                TRUE      ~ "two outs"))
+}
+```
+
+```{r}
+
+# Rebuild one game into a play-by-play table
+build_play_by_play <- function(gs) {
+
+  lu <- lineups %>% filter(game_string == gs)
+  if (nrow(lu) == 0) return(NULL)
+
+  ev <- ball_events %>%
+    filter(game_string == gs) %>%
+    collect() %>%
+    mutate(across(c(play_per_game, timestamp, player_id, ball_eventcode),
+                  as.numeric))
+
+  # A pickoff is not a plate appearance
+  pa <- lu %>% filter(!coalesce(is_pickoff, FALSE))
+
+  # One row per at-bat; the state is read at its first pitch
+  ab <- pa %>%
+    group_by(inning, half_inning, at_bat) %>%
+    summarise(first_play = min(play_per_game), last_play = max(play_per_game),
+              pitches = n(), batter = first(batter), pitcher = first(pitcher),
+              on_1b = first(on_1b), on_2b = first(on_2b), on_3b = first(on_3b),
+              home_team = first(home_team), away_team = first(away_team),
+              .groups = "drop") %>%
+    mutate(half_order = as.integer(half_inning == "Bottom")) %>%
+    arrange(inning, half_order, at_bat)
+
+  out <- list()
+
+  # Work half-inning by half-inning, because the 3-out rule is what closes the system
+  for (key in unique(paste(ab$inning, ab$half_order))) {
+
+    grp <- ab %>% filter(paste(inning, half_order) == key) %>% arrange(at_bat)
+    n   <- nrow(grp)
+    rec <- vector("list", n)
+
+    for (i in seq_len(n)) {
+      r   <- grp[i, ]
+      nxt <- if (i < n) grp[i + 1, ] else NULL
+
+      before <- c(r$on_1b, r$on_2b, r$on_3b); before <- before[!is.na(before)]
+      after  <- if (is.null(nxt)) character(0) else {
+        a <- c(nxt$on_1b, nxt$on_2b, nxt$on_3b); a[!is.na(a)]
+      }
+
+      # Which base does the batter occupy next time we see the field?
+      dest <- NA_integer_
+      if (!is.null(nxt)) {
+        dest <- 0L
+        if      (!is.na(nxt$on_1b) && nxt$on_1b == r$batter) dest <- 1L
+        else if (!is.na(nxt$on_2b) && nxt$on_2b == r$batter) dest <- 2L
+        else if (!is.na(nxt$on_3b) && nxt$on_3b == r$batter) dest <- 3L
+      }
+
+      # Only the final play of the at-bat decides the outcome
+      codes <- ev %>%
+        filter(play_per_game == r$last_play) %>%
+        arrange(timestamp) %>%
+        pull(ball_eventcode)
+
+      live <- is_live_contact(codes)
+
+      outcome <- if (EV[["HOMERUN"]] %in% codes) {
+        "home_run"
+      } else if (!is.na(dest) && dest > 0) {
+        if (!live) "walk_hbp"
+        else switch(as.character(dest), "1" = "single", "2" = "double",
+                    "3" = "triple", "single")
+      } else "out"
+
+      # Departures: skipped on the last at-bat, where stranded runners would
+      # be indistinguishable from runs
+      last_ab     <- is.null(nxt)
+      departed    <- if (last_ab) 0L else max(0L, length(before) + 1L - length(after))
+      batter_out  <- if (is.na(dest) || dest == 0) 1L else 0L
+      runners_out <- max(0L, departed - batter_out)
+
+      rec[[i]] <- list(
+        inning = as.integer(r$inning), half_inning = as.character(r$half_inning),
+        at_bat = as.integer(r$at_bat), first_play = as.numeric(r$first_play),
+        last_play = as.numeric(r$last_play), pitches = as.integer(r$pitches),
+        batter = as.character(r$batter), pitcher = as.character(r$pitcher),
+        home_team = as.character(r$home_team), away_team = as.character(r$away_team),
+        on_1b = as.character(r$on_1b), on_2b = as.character(r$on_2b),
+        on_3b = as.character(r$on_3b),
+        outcome = outcome, ball_in_play = live, n_before = length(before),
+        batter_out = batter_out, runners_gone = runners_out, last_ab = last_ab)
+    }
+
+    # Any outs the batters do not account for must be runners retired on the bases
+    batter_outs <- vapply(rec, function(x) x$batter_out, integer(1))
+    needed  <- min(max(0L, OUTS_PER_HALF - sum(batter_outs)),
+                   sum(vapply(rec, function(x) x$runners_gone, integer(1))))
+
+    # Charge those first where the batter was also retired -- the double play
+    ord <- order(batter_outs == 0,
+                 !vapply(rec, function(x) x$ball_in_play, logical(1)))
+    runner_outs <- integer(n)
+    left <- needed
+    for (i in ord) {
+      if (left <= 0) break
+      if (rec[[i]]$outcome == "home_run") next
+      take <- min(rec[[i]]$runners_gone, left)
+      runner_outs[i] <- take
+      left <- left - take
+    }
+
+    for (i in seq_len(n)) {
+      if (rec[[i]]$outcome == "home_run") {
+        rec[[i]]$runs <- rec[[i]]$n_before + 1L
+        rec[[i]]$outs_on_play <- 0L
+      } else if (rec[[i]]$last_ab) {
+        used <- sum(vapply(rec[seq_len(i - 1)], function(x) x$outs_on_play, integer(1)))
+        rec[[i]]$outs_on_play <- max(0L, OUTS_PER_HALF - used)
+        rec[[i]]$runs <- 0L
+      } else {
+        rec[[i]]$outs_on_play <- batter_outs[i] + runner_outs[i]
+        cap <- max_runs_possible(rec[[i]]$outcome, rec[[i]]$on_1b,
+                                 rec[[i]]$on_2b, rec[[i]]$on_3b)
+        rec[[i]]$runs <- as.integer(min(max(0L, rec[[i]]$runners_gone - runner_outs[i]),
+                                        cap))
+      }
+    }
+
+    # Running out count, clamped so the state can never be illegal
+    outs_before <- 0L
+    for (i in seq_len(n)) {
+      room <- OUTS_PER_HALF - outs_before
+      rec[[i]]$outs_on_play <- max(0L, min(rec[[i]]$outs_on_play, room))
+      rec[[i]]$outs_before  <- min(outs_before, OUTS_PER_HALF - 1L)
+      rec[[i]]$base_state   <- base_code(rec[[i]]$on_1b, rec[[i]]$on_2b, rec[[i]]$on_3b)
+      outs_before <- min(OUTS_PER_HALF, outs_before + rec[[i]]$outs_on_play)
+    }
+
+    out <- c(out, rec)
+  }
+
+  df <- bind_rows(lapply(out, function(x) {
+    x$last_ab <- NULL; x$batter_out <- NULL; x$runners_gone <- NULL
+    as_tibble(x)
+  }))
+
+  # Score progression and the situation string
+  df <- df %>%
+    arrange(inning, as.integer(half_inning == "Bottom"), at_bat) %>%
+    mutate(
+      game_string = gs,
+      batting_team = if_else(half_inning == "Top", away_team, home_team),
+      home_score = cumsum(if_else(half_inning == "Bottom", runs, 0L)),
+      away_score = cumsum(if_else(half_inning == "Top", runs, 0L)),
+      home_before = home_score - if_else(half_inning == "Bottom", runs, 0L),
+      away_before = away_score - if_else(half_inning == "Top", runs, 0L),
+      score_diff = if_else(half_inning == "Top",
+                           away_before - home_before, home_before - away_before),
+      situation = paste0(if_else(half_inning == "Top", "Top ", "Bot "), inning,
+                         ", ", describe_state(base_state, outs_before)))
+
+  # The win-probability target has to be complementary. Writing it as two
+  # strict inequalities marks BOTH sides as losers when a game ties, and the
+  # model then trains on contradictory rows. Ties go to the away side.
+  hf <- max(df$home_score); af <- max(df$away_score)
+
+  df %>% mutate(home_final = hf, away_final = af,
+                batting_won = if_else(half_inning == "Bottom",
+                                      as.integer(hf > af), as.integer(af >= hf)))
+}
+```
+
+```{r run-reconstruction}
+
+# Rebuild every game in the folder. Independent per game, so it is spread
+# across cores; mclapply falls back to one core on Windows.
+n_cores <- if (.Platform$OS.type == "unix") max(1L, parallel::detectCores() - 1L) else 1L
+
+pbp <- cached(paste0("play_by_play_", length(model_games)), {
+  parallel::mclapply(model_games, function(g) {
+    tryCatch(build_play_by_play(g), error = function(e) NULL)
+  }, mc.cores = n_cores) %>% bind_rows()
+})
+
+n_games <- n_distinct(pbp$game_string)
+```
+
+```{r}
+
+# Does the reconstruction look like baseball?
+tibble(
+  metric = c("Runs per game", "Hits per game", "Walks/HBP per game",
+             "Home runs per game", "Plate appearances per game"),
+  reconstructed = round(c(
+    sum(pbp$runs) / n_games,
+    sum(pbp$outcome %in% c("single", "double", "triple", "home_run")) / n_games,
+    sum(pbp$outcome == "walk_hbp") / n_games,
+    sum(pbp$outcome == "home_run") / n_games,
+    nrow(pbp) / n_games), 2),
+  real_milb = c(9.5, 18.0, 7.0, 2.0, 76.0)
+) %>%
+  kbl_or_note(paste0("Reconstruction vs real Minor League rates (",
+                       n_games, " games, ", comma(nrow(pbp)), " plate appearances)"))
+```
+
+<span style="color:red">**RESULT:**</span>
+
+`r comma(nrow(pbp))` plate appearances across `r n_games` games. Runs and plate
+appearances land within a few percent of real Minor League rates. Hits run about
+10% high, which is expected and honest: reaching on an **error** and a
+**fielder's choice** are indistinguishable from a single when all you have is
+base occupancy.
+
+# Part 2 — Win Probability, WPA and Leverage
+
+#### Methodology
+
+Run expectancy is estimated empirically: for every base-out state, the average
+number of runs scored from there to the end of the half-inning. Win probability
+is then a logistic model,
+
+$$
+\text{logit }P(\text{batting team wins}) = \beta_0 + \beta_1 D + \beta_2 I +
+\beta_3 (D \times I) + \beta_4 \frac{D}{I+1} + \beta_5 O + \beta_6 RE + \beta_7 H
+$$
+
+where $D$ is the score differential, $I$ the innings remaining, $O$ the outs,
+$RE$ the run expectancy of the current base-out state and $H$ an indicator for
+the home half. The $D \times I$ interaction is the important one — it lets a
+one-run lead be worth far more in the ninth than in the first.
+
+A model is used rather than an empirical lookup because 250 games cannot fill an
+(inning × base-out × margin) grid. A lookup gives jagged, non-monotonic
+probabilities that look broken on a scoreboard.
+
+## Step 5 — Run expectancy
+
+```{r}
+
+# Runs from each state to the end of the half-inning
+re_table <- pbp %>%
+  arrange(game_string, inning, half_inning, at_bat) %>%
+  group_by(game_string, inning, half_inning) %>%
+  mutate(runs_to_end = rev(cumsum(rev(runs)))) %>%
+  ungroup() %>%
+  filter(outs_before < OUTS_PER_HALF) %>%
+  group_by(base_state, outs_before) %>%
+  summarise(run_expectancy = mean(runs_to_end), n = n(), .groups = "drop")
+
+# Fast lookup used by the model features
+re_lookup <- setNames(re_table$run_expectancy,
+                      paste(re_table$base_state, re_table$outs_before))
+
+re_of <- function(state, outs) {
+  v <- unname(re_lookup[paste(state, outs)])
+  v[is.na(v) | outs >= OUTS_PER_HALF] <- 0
+  v
+}
+
+re_table %>%
+  mutate(bases = BASE_LABELS[base_state + 1],
+         outs = paste0(outs_before, if_else(outs_before == 1L, " out", " outs"))) %>%
+  select(bases, outs, run_expectancy) %>%
+  pivot_wider(names_from = outs, values_from = run_expectancy) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  kbl_or_note("Run expectancy — runs scored from each state to the end of the inning")
+```
+
+Every row falls as outs accumulate and every column rises as runners advance,
+which is the sanity check any run-expectancy table has to pass.
+
+## Step 6 — The win probability model
+
+```{r}
+
+# Model features, built from the reconstructed state
+wp_features <- function(d) {
+  d %>% mutate(
+    innings_left = pmax(0, 9 - inning + if_else(half_inning == "Top", 0.5, 0)),
+    is_home_half = as.integer(half_inning == "Bottom"),
+    runners_on   = as.integer(bitwAnd(base_state, 1L) > 0) +
+                   as.integer(bitwAnd(base_state, 2L) > 0) +
+                   as.integer(bitwAnd(base_state, 4L) > 0),
+    risp         = as.integer(bitwAnd(base_state, 6L) > 0),
+    re_state     = re_of(base_state, outs_before),
+    diff_x_left  = score_diff * innings_left,
+    diff_per_left = score_diff / (innings_left + 1),
+    outs         = outs_before)
+}
+
+wp_model <- glm(batting_won ~ score_diff + innings_left + diff_x_left +
+                  diff_per_left + outs + re_state + is_home_half +
+                  runners_on + risp,
+                family = binomial(), data = wp_features(pbp))
+
+predict_wp <- function(d) as.numeric(predict(wp_model, wp_features(d),
+                                             type = "response"))
+
+# Fit quality
+wp_p <- predict_wp(pbp)
+wp_y <- pbp$batting_won
+
+wp_acc   <- round(mean((wp_p >= 0.5) == (wp_y == 1)), 3)
+wp_brier <- round(mean((wp_p - wp_y)^2), 3)
+
+tibble(metric = c("Plate appearances", "Accuracy", "Brier score", "Base rate"),
+       value  = c(comma(nrow(pbp)), wp_acc, wp_brier, round(mean(wp_y), 3))) %>%
+  kbl_or_note("Win probability model fit")
+```
+
+## Step 7 — Win Probability Added
+
+WPA is simply the change in win probability across a plate appearance. The one
+subtlety is the half-inning flip: after the third out the other team bats, so
+the batting team's win probability becomes the **complement** of the next state's.
+
+```{r}
+
+pbp <- pbp %>% arrange(game_string, inning,
+                       as.integer(half_inning == "Bottom"), at_bat)
+pbp$wp_before <- predict_wp(pbp)
+
+pbp <- pbp %>%
+  group_by(game_string) %>%
+  mutate(
+    next_wp   = lead(wp_before),
+    same_side = lead(half_inning) == half_inning & lead(inning) == inning,
+    wp_after  = case_when(is.na(next_wp) ~ as.numeric(batting_won),
+                          same_side      ~ next_wp,
+                          TRUE           ~ 1 - next_wp),
+    wpa = wp_after - wp_before) %>%
+  select(-next_wp, -same_side) %>%
+  ungroup()
+```
+
+## Step 8 — Leverage Index
+
+**METHOD:** Leverage asks *how much can the game move from here?* For each state
+we enumerate the plausible outcomes of a plate appearance with their league
+frequencies, apply each one, and average the resulting $|\Delta WP|$:
+
+$$LI(\text{state}) = \frac{E\big[\,|\Delta WP|\ \big|\ \text{state}\big]}{E\big[\,|\Delta WP|\,\big]}$$
+
+The denominator normalises so an average plate appearance is exactly 1.0.
+
+```{r}
+
+# What a state becomes after each outcome -- applied to every row at once
+apply_outcome <- function(state, outs, kind) {
+  n   <- length(state)
+  on1 <- bitwAnd(state, 1L) > 0
+  on2 <- bitwAnd(state, 2L) > 0
+  on3 <- bitwAnd(state, 4L) > 0
+  bits <- function(a, b, c) as.integer(a) + 2L * as.integer(b) + 4L * as.integer(c)
+
+  switch(kind,
+    "out"      = list(base = state, outs = outs + 1L, runs = rep(0L, n)),
+    "walk_hbp" = list(base = case_when(!on1 ~ bits(TRUE, on2, on3),
+                                       !on2 ~ bits(TRUE, TRUE, on3),
+                                       TRUE ~ 7L),
+                      outs = outs, runs = as.integer(on1 & on2 & on3)),
+    "single"   = list(base = bits(TRUE, on1, rep(FALSE, n)), outs = outs,
+                      runs = as.integer(on2) + as.integer(on3)),
+    "double"   = list(base = rep(2L, n), outs = outs,
+                      runs = as.integer(on1) + as.integer(on2) + as.integer(on3)),
+    "triple"   = list(base = rep(4L, n), outs = outs,
+                      runs = as.integer(on1) + as.integer(on2) + as.integer(on3)),
+    "home_run" = list(base = rep(0L, n), outs = outs,
+                      runs = 1L + as.integer(on1) + as.integer(on2) + as.integer(on3)),
+    list(base = state, outs = outs, runs = rep(0L, n)))
+}
+```
+
+```{r}
+
+# League frequency of each outcome
+mix <- pbp %>% count(outcome) %>% mutate(p = n / sum(n))
+
+wp_now <- predict_wp(pbp)
+swing  <- rep(0, nrow(pbp))
+
+# One prediction per outcome across the whole season, not one per plate
+# appearance -- six model calls instead of tens of thousands
+for (k in mix$outcome) {
+
+  st    <- apply_outcome(pbp$base_state, pbp$outs_before, k)
+  ended <- st$outs >= OUTS_PER_HALF
+
+  nxt <- tibble(
+    inning      = if_else(ended & pbp$half_inning == "Bottom", pbp$inning + 1L, pbp$inning),
+    half_inning = if_else(ended, if_else(pbp$half_inning == "Top", "Bottom", "Top"),
+                          pbp$half_inning),
+    outs_before = if_else(ended, 0L, st$outs),
+    base_state  = if_else(ended, 0L, st$base),
+    score_diff  = if_else(ended, -(pbp$score_diff + st$runs), pbp$score_diff + st$runs))
+
+  wp_next <- predict_wp(nxt)
+  wp_next <- if_else(ended, 1 - wp_next, wp_next)   # sides changed
+
+  swing <- swing + mix$p[mix$outcome == k] * abs(wp_next - wp_now)
+}
+
+pbp <- pbp %>%
+  mutate(leverage = swing / mean(swing, na.rm = TRUE),
+         # win impact weighted by what was at stake, compressed so one enormous
+         # play does not flatten the leaderboard
+         clutch = 100 * tanh(3 * abs(wpa) * sqrt(pmax(leverage, 0))))
+
+li_mean <- round(mean(pbp$leverage), 3)
+li_max  <- round(max(pbp$leverage), 2)
+```
+
+```{r}
+
+# The biggest swings of the season
+pbp %>%
+  arrange(desc(abs(wpa))) %>%
+  transmute(game = game_string, inning, half = half_inning, batter, outcome, runs,
+            wp_before = round(wp_before, 3), wp_after = round(wp_after, 3),
+            WPA = round(wpa, 3), leverage = round(leverage, 2)) %>%
+  head(8) %>%
+  kbl_or_note("Biggest win-probability swings of the season")
+```
+
+<span style="color:red">**RESULT:**</span>
+
+Win probability fits at **`r wp_acc`** accuracy with a Brier score of
+**`r wp_brier`**. Leverage normalises to a mean of **`r li_mean`** with a
+maximum of **`r li_max`**. The largest swings are walk-off home runs and
+game-ending outs — the model was never told what a walk-off is, it simply found
+the plays where win probability moved most.
+
+# Part 3 — Tracking Metrics
+
+## Step 9 — One extraction pass
+
+Every metric below comes from the same pass over the tracking data. Doing it
+once per game and caching keeps the document re-renderable in seconds.
+
+```{r}
+
+# Speed between consecutive frames, in ft/s
+frame_speed <- function(x, y, ts) {
+  dt <- diff(ts) / 1000
+  d  <- sqrt(diff(x)^2 + diff(y)^2)
+  ifelse(dt > 0, d / dt, NA_real_)
+}
+
+# A high percentile rather than the maximum -- one mistracked frame can
+# produce an absurd instantaneous value
+peak <- function(v, p = 0.90) {
+  v <- v[is.finite(v)]
+  if (length(v) == 0) return(NA_real_)
+  unname(quantile(v, p))
+}
+
+# 3-D ball speed between frames
+ball_speed <- function(b) {
+  dt <- diff(b$timestamp) / 1000
+  d  <- sqrt(diff(b$ball_position_x)^2 + diff(b$ball_position_y)^2 +
+             diff(b$ball_position_z)^2)
+  ifelse(dt > 0, d / dt, NA_real_)
+}
+
+dist_to <- function(x, y, pt) sqrt((x - pt[1])^2 + (y - pt[2])^2)
+```
+
+```{r extract-features}
+
+# Empty prototypes, one per table.
+#
+# bind_rows() on an empty list returns a 0x0 tibble with NO columns, so any
+# later summarise() fails with "object 'exchange' not found" rather than simply
+# producing an empty result. On a small sample plenty of these tables legitimately
+# have no rows -- a single game may contain no throw to second, no double play
+# turn, no pickoff -- so every table falls back to a typed empty tibble.
+PROTO <- list(
+  pitches = tibble(game_string = character(), play = numeric(),
+                   pitch_velo = numeric(), plate_x = numeric(),
+                   plate_z = numeric(), extension = numeric(),
+                   induced_break = numeric(), horizontal_break = numeric(),
+                   in_play = integer()),
+  hits    = tibble(game_string = character(), play = numeric(),
+                   exit_velo = numeric(), launch = numeric(), carry = numeric(),
+                   spray_x = numeric(), spray_y = numeric(), is_hr = integer()),
+  catches = tibble(game_string = character(), play = numeric(),
+                   fielder_id = numeric(), catch_made = integer(),
+                   route = numeric(), hang = numeric(), closing = numeric(),
+                   efficiency = numeric()),
+  throws  = tibble(game_string = character(), play = numeric(),
+                   fielder_id = numeric(), throw_velo = numeric(),
+                   transfer = numeric()),
+  runs    = tibble(game_string = character(), play = numeric(),
+                   sprint_mph = numeric(), time_to_first = numeric(),
+                   burst = numeric(), path_efficiency = numeric()),
+  pivots  = tibble(game_string = character(), play = numeric(),
+                   pos = character(), pivot = numeric()),
+  pops    = tibble(game_string = character(), play = numeric(),
+                   exchange = numeric(), throw_velo = numeric()),
+  leads   = tibble(game_string = character(), play = numeric(),
+                   runner = character(), lead_ft = numeric(),
+                   burst_mph = numeric()))
+
+# Bind a list of rows, falling back to the typed prototype when there are none
+bind_or_empty <- function(rows, proto) {
+  out <- bind_rows(rows)
+  if (nrow(out) == 0) proto else out
+}
+
+# Pull every tracking measurement we need for one game
+extract_game <- function(gs) {
+
+  ev <- ball_events %>% filter(game_string == gs) %>% collect() %>%
+    mutate(across(c(play_per_game, timestamp, player_id, ball_eventcode), as.numeric))
+  bp <- ball_positions %>% filter(game_string == gs) %>% collect() %>%
+    mutate(across(c(play_per_game, timestamp, ball_position_x,
+                    ball_position_y, ball_position_z), as.numeric))
+  pp <- player_positions %>% filter(game_string == gs) %>% collect() %>%
+    mutate(across(c(play_per_game, timestamp, player_id, field_x, field_y), as.numeric)) %>%
+    filter(player_id <= 13)
+
+  pitches <- list(); hits <- list(); catches <- list()
+  throws  <- list(); runs_l <- list(); pivots <- list(); pops <- list()
+  leads   <- list()
+
+  for (pl in sort(unique(ev$play_per_game))) {
+
+    e <- ev %>% filter(play_per_game == pl) %>% arrange(timestamp)
+    b <- bp %>% filter(play_per_game == pl) %>% arrange(timestamp)
+    if (nrow(b) < 3) next
+
+    ## ---- the pitch -------------------------------------------------------
+    t_pitch <- e$timestamp[e$ball_eventcode == EV[["PITCH"]]]
+    if (length(t_pitch)) {
+      t0 <- min(t_pitch)
+      w  <- b %>% filter(timestamp >= t0, timestamp <= t0 + 800)
+      if (nrow(w) >= 3) {
+        v <- peak(ball_speed(w), 0.90) * MPH
+
+        # Where the pitch crossed the plate: interpolate between the frames
+        # that straddle y = 0
+        yv <- w$ball_position_y
+        cross <- which(yv[-length(yv)] > 0 & yv[-1] <= 0)[1]
+        px <- NA_real_; pz <- NA_real_; ext <- NA_real_
+        if (!is.na(cross)) {
+          f  <- yv[cross] / (yv[cross] - yv[cross + 1])
+          px <- w$ball_position_x[cross] + f * diff(w$ball_position_x[cross:(cross+1)])
+          pz <- w$ball_position_z[cross] + f * diff(w$ball_position_z[cross:(cross+1)])
+        }
+        # Extension: how far down the mound the ball was released
+        ext <- RUBBER_FT - max(yv)
+
+        # Movement. Gravity alone drops a 90 mph pitch about 39 inches, so the
+        # raw deviation from a straight line makes every pitch look filthy.
+        # Subtracting it leaves the induced (spin) component.
+        flight <- if (is.finite(v) && v > 0) max(yv) / ((v / MPH) * DRAG_FACTOR) else NA_real_
+        drop_g <- if (is.finite(flight)) 0.5 * GRAVITY * flight^2 * 12 else NA_real_
+
+        ivb <- NA_real_; hb <- NA_real_
+        if (nrow(w) >= 4 && is.finite(drop_g)) {
+          # straight line from release along the initial direction
+          slope_z <- (w$ball_position_z[2] - w$ball_position_z[1]) /
+                     (w$ball_position_y[2] - w$ball_position_y[1])
+          slope_x <- (w$ball_position_x[2] - w$ball_position_x[1]) /
+                     (w$ball_position_y[2] - w$ball_position_y[1])
+          dy <- 0 - w$ball_position_y[1]
+          ivb <- ((pz - (w$ball_position_z[1] + slope_z * dy)) * 12) + drop_g
+          hb  <-  (px - (w$ball_position_x[1] + slope_x * dy)) * 12
+        }
+
+        if (is.finite(v) && v > 40 && v <= 103) {
+          pitches[[length(pitches) + 1]] <- tibble(
+            game_string = gs, play = pl, pitch_velo = round(v, 1),
+            plate_x = round(px, 3), plate_z = round(pz, 3),
+            extension = round(ext, 2),
+            induced_break = round(ivb, 1), horizontal_break = round(hb, 1),
+            in_play = as.integer(EV[["HIT"]] %in% e$ball_eventcode))
+        }
+      }
+    }
+
+    ## ---- the batted ball -------------------------------------------------
+    t_hit <- e$timestamp[e$ball_eventcode == EV[["HIT"]]]
+    if (!length(t_hit)) next
+    th <- min(t_hit)
+
+    w <- b %>% filter(timestamp >= th, timestamp <= th + 400)
+    if (nrow(w) >= 3) {
+      exit_v <- peak(ball_speed(w), 0.95) * MPH
+
+      # Launch angle from the first ~150 ms of flight
+      k <- min(4, nrow(w) - 1)
+      horiz <- sqrt((w$ball_position_x[k+1] - w$ball_position_x[1])^2 +
+                    (w$ball_position_y[k+1] - w$ball_position_y[1])^2)
+      la <- if (horiz > 0) {
+        atan2(w$ball_position_z[k+1] - w$ball_position_z[1], horiz) * 180 / pi
+      } else NA_real_
+
+      # Carry: distance at the first bounce, NOT the ball's furthest point --
+      # relay throws move it further from home after it lands
+      bpost  <- b %>% filter(timestamp >= th)
+      bounce <- e$timestamp[e$ball_eventcode == EV[["BOUNCE"]] & e$timestamp > th]
+      idx <- if (length(bounce)) {
+        which.min(abs(bpost$timestamp - min(bounce)))
+      } else {
+        apex <- which.max(bpost$ball_position_z)
+        apex + which.min(abs(bpost$ball_position_z[apex:nrow(bpost)] -
+                             bpost$ball_position_z[1])) - 1
+      }
+      idx <- min(max(idx, 1), nrow(bpost))
+      carry <- sqrt(bpost$ball_position_x[idx]^2 + bpost$ball_position_y[idx]^2)
+
+      if (is.finite(exit_v) && exit_v > 20 && exit_v < 125) {
+        hits[[length(hits) + 1]] <- tibble(
+          game_string = gs, play = pl,
+          exit_velo = round(exit_v, 1), launch = round(la, 1),
+          carry = round(carry, 1), spray_x = round(bpost$ball_position_x[idx], 1),
+          spray_y = round(bpost$ball_position_y[idx], 1),
+          is_hr = as.integer(EV[["HOMERUN"]] %in% e$ball_eventcode))
+      }
+    }
+
+    ## ---- the fielder -----------------------------------------------------
+    acq <- e %>% filter(ball_eventcode %in% c(EV[["ACQUIRED"]], EV[["ACQUIRED_UNK"]]),
+                        timestamp >= th, player_id >= 1, player_id <= 9)
+
+    ball_depth <- max(sqrt(b$ball_position_x^2 + b$ball_position_y^2))
+
+    if (nrow(acq) && (min(acq$timestamp) - th) / 1000 < 12) {
+
+      fid <- acq$player_id[1]; ta <- acq$timestamp[1]
+      trk <- pp %>% filter(player_id == fid) %>% arrange(timestamp)
+      p0  <- trk %>% filter(timestamp <= th) %>% tail(1)
+      p1  <- trk %>% filter(timestamp <= ta) %>% tail(1)
+
+      if (nrow(p0) && nrow(p1)) {
+        route <- sqrt((p1$field_x - p0$field_x)^2 + (p1$field_y - p0$field_y)^2)
+        hang  <- (ta - th) / 1000
+        run   <- trk %>% filter(timestamp >= th, timestamp <= ta)
+        close <- if (nrow(run) >= 3) peak(frame_speed(run$field_x, run$field_y,
+                                                      run$timestamp), 0.90) else NA_real_
+        # path efficiency: straight line divided by distance actually covered
+        travelled <- if (nrow(run) >= 2) {
+          sum(sqrt(diff(run$field_x)^2 + diff(run$field_y)^2))
+        } else NA_real_
+
+        # A catch opportunity is a ball that reached the outfield
+        if (ball_depth > 130 && hang > 0.4 && hang < 8 && route < 160) {
+          catches[[length(catches) + 1]] <- tibble(
+            game_string = gs, play = pl, fielder_id = fid,
+            catch_made = 1L, route = round(route, 1), hang = round(hang, 2),
+            closing = round(close, 1),
+            efficiency = round(pmin(1, route / pmax(travelled, 1e-6)), 3))
+        }
+      }
+
+      # Throw velocity after the fielder releases it
+      thr <- e %>% filter(ball_eventcode %in% c(EV[["THROW"]], EV[["THROW_UNK"]]),
+                          player_id == fid, timestamp >= ta)
+      if (nrow(thr)) {
+        tt <- thr$timestamp[1]
+        wt <- b %>% filter(timestamp >= tt, timestamp <= tt + 500)
+        if (nrow(wt) >= 3) {
+          tv <- peak(ball_speed(wt), 0.90) * MPH
+          if (is.finite(tv) && tv > 30 && tv < 110) {
+            throws[[length(throws) + 1]] <- tibble(
+              game_string = gs, play = pl, fielder_id = fid,
+              throw_velo = round(tv, 1),
+              transfer = round((tt - ta) / 1000, 2))
+          }
+        }
+      }
+    } else if (ball_depth > 130) {
+      # Nobody caught it: find the ball's landing spot and the nearest outfielder
+      bpost <- b %>% filter(timestamp >= th)
+      land  <- bpost[which.min(bpost$ball_position_z), ]
+      hang  <- (land$timestamp - th) / 1000
+
+      best <- NULL
+      for (oid in 7:9) {
+        o <- pp %>% filter(player_id == oid, timestamp <= th) %>% tail(1)
+        if (!nrow(o)) next
+        d <- sqrt((o$field_x - land$ball_position_x)^2 +
+                  (o$field_y - land$ball_position_y)^2)
+        if (is.null(best) || d < best$d) best <- list(id = oid, d = d)
+      }
+      if (!is.null(best) && hang > 0.4 && hang < 8 && best$d < 200) {
+        catches[[length(catches) + 1]] <- tibble(
+          game_string = gs, play = pl, fielder_id = best$id,
+          catch_made = 0L, route = round(best$d, 1), hang = round(hang, 2),
+          closing = NA_real_, efficiency = NA_real_)
+      }
+    }
+
+    ## ---- the batter's run -------------------------------------------------
+    bat <- pp %>% filter(player_id == 10, timestamp >= th) %>% arrange(timestamp)
+    if (nrow(bat) >= 5) {
+      sp  <- frame_speed(bat$field_x, bat$field_y, bat$timestamp)
+      top <- peak(sp, 0.95)
+
+      # Time to first: the frame the runner enters a 4 ft radius of the bag
+      d_first <- dist_to(bat$field_x, bat$field_y, BASES$first)
+      reach   <- which(d_first <= 4)[1]
+      t_first <- if (!is.na(reach)) (bat$timestamp[reach] - th) / 1000 else NA_real_
+
+      # Burst: speed gained over the first 1.5 seconds out of the box
+      early <- bat %>% filter(timestamp <= th + 1500)
+      burst <- if (nrow(early) >= 3) {
+        es <- frame_speed(early$field_x, early$field_y, early$timestamp)
+        es <- es[is.finite(es)]
+        if (length(es) >= 2) (max(es) - es[1]) / 1.5 else NA_real_
+      } else NA_real_
+
+      moved <- sum(sqrt(diff(bat$field_x)^2 + diff(bat$field_y)^2))
+
+      if (is.finite(top) && top > 5 && top < 35 && moved > 30) {
+        runs_l[[length(runs_l) + 1]] <- tibble(
+          game_string = gs, play = pl,
+          sprint_mph = round(top * MPH, 2),
+          time_to_first = round(t_first, 2),
+          burst = round(burst, 1),
+          path_efficiency = round(pmin(1, dist_to(bat$field_x[1], bat$field_y[1],
+                                                  BASES$first) / pmax(moved, 1e-6)), 3))
+      }
+    }
+
+    ## ---- middle infield pivot (double play) -------------------------------
+    for (pid in c(4, 6)) {
+      a <- e %>% filter(player_id == pid, ball_eventcode == EV[["ACQUIRED"]])
+      t <- e %>% filter(player_id == pid, ball_eventcode == EV[["THROW"]])
+      if (nrow(a) && nrow(t)) {
+        dt <- (t$timestamp[1] - a$timestamp[1]) / 1000
+        if (dt >= 0 && dt < 2) {
+          pivots[[length(pivots) + 1]] <- tibble(
+            game_string = gs, play = pl, pos = POS[as.character(pid)],
+            pivot = round(dt, 2))
+        }
+      }
+    }
+
+    ## ---- catcher pop time -------------------------------------------------
+    a <- e %>% filter(player_id == 2, ball_eventcode == EV[["ACQUIRED"]])
+    t <- e %>% filter(player_id == 2,
+                      ball_eventcode %in% c(EV[["THROW"]], EV[["THROW_UNK"]]))
+    if (nrow(a) && nrow(t)) {
+      dt <- (t$timestamp[1] - a$timestamp[1]) / 1000
+      if (dt >= 0 && dt < 3) {
+        wt <- b %>% filter(timestamp >= t$timestamp[1],
+                           timestamp <= t$timestamp[1] + 600)
+        cv <- if (nrow(wt) >= 3) peak(ball_speed(wt), 0.90) * MPH else NA_real_
+        pops[[length(pops) + 1]] <- tibble(
+          game_string = gs, play = pl, exchange = round(dt, 2),
+          throw_velo = round(cv, 1))
+      }
+    }
+  }
+
+  ## ---- secondary leads on pickoff plays ------------------------------------
+  pick_plays <- lineups %>%
+    filter(game_string == gs, coalesce(is_pickoff, FALSE)) %>%
+    pull(play_per_game) %>% unique()
+
+  for (pl in pick_plays) {
+    for (rid in 11:13) {
+      trk <- pp %>% filter(play_per_game == pl, player_id == rid) %>%
+        arrange(timestamp)
+      if (nrow(trk) < 3) next
+      bag  <- switch(as.character(rid), "11" = BASES$first,
+                     "12" = BASES$second, BASES$third)
+      lead <- dist_to(trk$field_x[1], trk$field_y[1], bag)
+      brst <- peak(frame_speed(trk$field_x, trk$field_y, trk$timestamp), 0.95)
+      if (is.finite(lead) && lead > 0 && lead < 30) {
+        leads[[length(leads) + 1]] <- tibble(
+          game_string = gs, play = pl, runner = POS[as.character(rid)],
+          lead_ft = round(lead, 1), burst_mph = round(brst * MPH, 1))
+      }
+    }
+  }
+
+  list(pitches = bind_or_empty(pitches, PROTO$pitches),
+       hits    = bind_or_empty(hits,    PROTO$hits),
+       catches = bind_or_empty(catches, PROTO$catches),
+       throws  = bind_or_empty(throws,  PROTO$throws),
+       runs    = bind_or_empty(runs_l,  PROTO$runs),
+       pivots  = bind_or_empty(pivots,  PROTO$pivots),
+       pops    = bind_or_empty(pops,    PROTO$pops),
+       leads   = bind_or_empty(leads,   PROTO$leads))
+}
+```
+
+```{r run-extraction}
+
+# One pass over every game. Slow the first time, cached afterwards.
+features <- cached(paste0("tracking_features_", length(track_games)), {
+
+  # Run this one sequentially and announce each game. It reads the 4.5 GB
+  # player-positions directory, so it is by far the slowest step -- with
+  # mclapply it prints nothing at all and simply looks frozen.
+  parts <- vector("list", length(track_games))
+
+  for (i in seq_along(track_games)) {
+    message(sprintf("  [%d/%d] extracting %s", i, length(track_games),
+                    track_games[i]))
+    parts[[i]] <- tryCatch(extract_game(track_games[i]),
+                           error = function(e) {
+                             message("      skipped: ", conditionMessage(e))
+                             NULL
+                           })
+  }
+
+  parts <- parts[!vapply(parts, is.null, logical(1))]
+
+  # Same fallback when combining across games -- if no game produced a table,
+  # keep the typed empty version rather than a 0x0 tibble
+  combine <- function(name) bind_or_empty(lapply(parts, `[[`, name), PROTO[[name]])
+
+  list(pitches = combine("pitches"), hits    = combine("hits"),
+       catches = combine("catches"), throws  = combine("throws"),
+       runs    = combine("runs"),    pivots  = combine("pivots"),
+       pops    = combine("pops"),    leads   = combine("leads"))
+})
+
+pitches <- features$pitches; hits   <- features$hits
+catches <- features$catches; throws <- features$throws
+runs    <- features$runs;    pivots <- features$pivots
+pops    <- features$pops;    leads  <- features$leads
+```
+
+```{r}
+
+# Attach the player behind each play, via the lineup
+lineup_key <- lineups %>%
+  distinct(game_string, play_per_game, .keep_all = TRUE)
+
+add_player <- function(df, column) {
+  key <- lineup_key %>%
+    select(game_string, play_per_game, player = all_of(column))
+  df %>%
+    left_join(key, by = c("game_string", "play" = "play_per_game")) %>%
+    mutate(team = str_split_i(player, "-", 1))
+}
+
+# Fielders are looked up by their position number
+fielder_cols <- c("1" = "pitcher", "2" = "catcher", "3" = "first_baseman",
+                  "4" = "second_baseman", "5" = "third_baseman", "6" = "shortstop",
+                  "7" = "left_fielder", "8" = "center_fielder", "9" = "right_fielder")
+
+add_fielder <- function(df) {
+  key <- lineup_key %>%
+    select(game_string, play_per_game, all_of(unname(fielder_cols))) %>%
+    pivot_longer(-c(game_string, play_per_game),
+                 names_to = "col", values_to = "player") %>%
+    mutate(fielder_id = as.numeric(names(fielder_cols)[match(col, fielder_cols)])) %>%
+    select(-col)
+
+  df %>%
+    left_join(key, by = c("game_string", "play" = "play_per_game", "fielder_id")) %>%
+    mutate(pos = POS[as.character(fielder_id)],
+           team = str_split_i(player, "-", 1))
+}
+
+hits    <- add_player(hits, "batter")
+runs    <- add_player(runs, "batter")
+pitches <- add_player(pitches, "pitcher")
+catches <- add_fielder(catches)
+throws  <- add_fielder(throws)
+```
+
+## Speed & Baserunning
+
+### Burner Board
+
+Peak sprint speed on the way to first, ranked across the league.
+
+```{r}
+
+burner <- runs %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarise(top_mph = max(sprint_mph, na.rm = TRUE),
+            avg_mph = round(mean(sprint_mph, na.rm = TRUE), 2),
+            attempts = n(), team = first(team), .groups = "drop") %>%
+  filter(attempts >= scale_min(3)) %>%
+  arrange(desc(top_mph))
+
+burner %>% head(10) %>%
+  kbl_or_note("Burner Board — fastest to first")
+```
+
+```{r}
+
+ggplot(head(burner, 12), aes(x = reorder(player, top_mph), y = top_mph)) +
+  geom_col(fill = GREEN, alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.1f", top_mph)), hjust = -0.15, size = 3.4) +
+  coord_flip(ylim = c(min(head(burner,12)$top_mph) - 1, max(burner$top_mph) + 0.8)) +
+  labs(title = "Burner Board", subtitle = "Peak sprint speed on the way to first",
+       x = NULL, y = "mph") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Home-to-First Dash
+
+Elapsed time from contact to the bag — measured as the frame the runner enters a
+4-foot radius, not estimated from speed.
+
+```{r}
+
+dash <- runs %>%
+  filter(!is.na(player), is.finite(time_to_first),
+         time_to_first > 3, time_to_first < 7.5) %>%
+  group_by(player) %>%
+  summarise(best = min(time_to_first), avg = round(mean(time_to_first), 2),
+            tries = n(), .groups = "drop") %>%
+  mutate(grade = case_when(best < 4.2 ~ "ELITE",
+                           best < 4.5 ~ "PLUS",
+                           TRUE       ~ "AVERAGE")) %>%
+  arrange(best)
+
+dash %>% head(10) %>%
+  kbl_or_note("Home-to-First Dash — beat the clock")
+```
+
+### Fastest Out of the Box
+
+Acceleration over the first 1.5 seconds, which is the window where reaction and
+first step actually show up.
+
+```{r}
+
+box <- runs %>%
+  filter(!is.na(player), is.finite(burst), burst > 0) %>%
+  group_by(player) %>%
+  summarise(best_burst = round(max(burst), 1), avg_burst = round(mean(burst), 1),
+            n = n(), .groups = "drop") %>%
+  filter(n >= scale_min(3)) %>%
+  arrange(desc(best_burst))
+
+box %>% head(10) %>%
+  kbl_or_note("Fastest Out of the Box — ft/s gained in 1.5 seconds")
+```
+
+### Extra-Base Instinct
+
+Speed and path efficiency when a runner actually takes an extra base.
+
+```{r}
+
+extra <- pbp %>%
+  filter(outcome %in% c("double", "triple")) %>%
+  select(game_string, play = last_play, outcome) %>%
+  inner_join(runs, by = c("game_string", "play")) %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarise(top_mph = max(sprint_mph), efficiency = round(mean(path_efficiency, na.rm = TRUE), 3),
+            extra_bases = n(), triples = sum(outcome == "triple"), .groups = "drop") %>%
+  arrange(desc(extra_bases), desc(top_mph))
+
+extra %>% head(10) %>%
+  kbl_or_note("Extra-Base Instinct — speed and route on doubles and triples")
+```
+
+### Pickoff Jump
+
+<div class="metric-note">
+The data flags pickoff attempts but records **no outcome**, and there are no
+stolen-base or caught-stealing labels anywhere. So this reports the *measured*
+secondary lead and burst rather than a modelled steal probability — a real
+number beats an invented one.
+</div>
+
+```{r}
+
+jump <- leads %>%
+  group_by(runner) %>%
+  summarise(plays = n(), avg_lead = round(mean(lead_ft), 1),
+            max_lead = round(max(lead_ft), 1),
+            avg_burst = round(mean(burst_mph, na.rm = TRUE), 1), .groups = "drop")
+
+kbl_or_note(jump, "Pickoff Jump — measured secondary lead and burst",
+            "No pickoff attempts in this sample — raise N_TRACK_GAMES.")
+```
+
+## Power & Hitting
+
+### Statcast Smash
+
+Ranked on the 90th percentile rather than the single hardest ball, so the
+leaderboard rewards repeatable damage.
+
+```{r}
+
+smash <- hits %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarise(max_ev = max(exit_velo), p90_ev = round(quantile(exit_velo, 0.90), 1),
+            avg_ev = round(mean(exit_velo), 1), balls = n(),
+            team = first(team), .groups = "drop") %>%
+  filter(balls >= scale_min(5)) %>%
+  arrange(desc(p90_ev), desc(max_ev))
+
+smash %>% head(10) %>%
+  kbl_or_note("Statcast Smash — hardest hitters")
+```
+
+```{r}
+
+ggplot(hits, aes(exit_velo)) +
+  geom_histogram(binwidth = 2, fill = BLUE, alpha = 0.85) +
+  geom_vline(xintercept = quantile(hits$exit_velo, 0.99), colour = RED, linewidth = 1) +
+  annotate("text", x = quantile(hits$exit_velo, 0.99) - 2,
+           y = Inf, vjust = 2, hjust = 1, colour = RED, size = 3.2,
+           label = paste0("99th pct = ", round(quantile(hits$exit_velo, 0.99)), " mph")) +
+  labs(title = "Exit velocity across the season",
+       x = "Exit velocity (mph)", y = "Batted balls") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Moonshot Meter
+
+```{r}
+
+moonshot <- hits %>%
+  filter(!is.na(player), launch >= 10, carry >= 150) %>%
+  group_by(player) %>%
+  summarise(longest = max(carry), avg = round(mean(carry), 1),
+            flies = n(), team = first(team), .groups = "drop") %>%
+  filter(flies >= scale_min(3)) %>%
+  arrange(desc(longest))
+
+moonshot %>% head(10) %>%
+  kbl_or_note("Moonshot Meter — longest carry")
+```
+
+### Barrel Zone
+
+A barrel is the sweet spot: exit velocity at least 95 mph with a launch angle
+between 20 and 35 degrees.
+
+```{r}
+
+hits <- hits %>%
+  mutate(barrel = as.integer(exit_velo >= 95 & launch >= 20 & launch <= 35))
+
+barrels <- hits %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarise(barrels = sum(barrel), balls = n(),
+            rate = round(100 * mean(barrel), 1), team = first(team),
+            .groups = "drop") %>%
+  filter(balls >= scale_min(8)) %>%
+  arrange(desc(barrels), desc(rate))
+
+barrels %>% head(10) %>%
+  kbl_or_note("Barrel Zone — sweet-spot contact")
+```
+
+```{r}
+
+ggplot(hits %>% filter(launch > -40, launch < 80),
+       aes(exit_velo, launch)) +
+  geom_hex(bins = 34) +
+  scale_fill_gradient(low = "#1b2a3d", high = GOLD, trans = "log10") +
+  annotate("rect", xmin = 95, xmax = max(hits$exit_velo), ymin = 20, ymax = 35,
+           fill = NA, colour = RED, linewidth = 1) +
+  annotate("text", x = 95, y = 42, label = "BARREL ZONE", colour = RED,
+           fontface = "bold", size = 3.5, hjust = 0) +
+  labs(title = "Where barrels live",
+       x = "Exit velocity (mph)", y = "Launch angle (degrees)", fill = "Balls") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Launch Angle Rainbow
+
+```{r}
+
+rainbow <- hits %>%
+  mutate(type = cut(launch, c(-90, 10, 25, 50, 90),
+                    labels = c("ground ball", "line drive", "fly ball", "pop up")))
+
+rainbow %>%
+  filter(!is.na(type)) %>%
+  group_by(type) %>%
+  summarise(n = n(), avg_ev = round(mean(exit_velo), 1),
+            avg_carry = round(mean(carry), 1),
+            hr_rate = round(100 * mean(is_hr), 1), .groups = "drop") %>%
+  kbl_or_note("Launch Angle Rainbow — what each batted-ball type produces")
+```
+
+```{r}
+
+ggplot(rainbow %>% filter(launch > -40, launch < 80, carry < 500),
+       aes(launch, carry, colour = exit_velo)) +
+  geom_point(alpha = 0.45, size = 1.1) +
+  scale_colour_gradient(low = BLUE, high = RED) +
+  labs(title = "Launch Angle Rainbow",
+       subtitle = "The same exit velocity is a groundout at 5 degrees and a home run at 28",
+       x = "Launch angle (degrees)", y = "Carry (feet)", colour = "Exit velo") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Clutch Contact
+
+Contact quality weighted by what was at stake: $\frac{EV}{100}\times\sqrt{LI}$.
+
+```{r}
+
+clutch_contact <- pbp %>%
+  select(game_string, play = last_play, inning, half_inning, batter,
+         outcome, wpa, leverage) %>%
+  inner_join(hits %>% select(game_string, play, exit_velo, carry),
+             by = c("game_string", "play")) %>%
+  mutate(score = round(exit_velo / 100 * sqrt(leverage), 3)) %>%
+  arrange(desc(score))
+
+clutch_contact %>%
+  transmute(game = game_string, inning, half = half_inning, batter, outcome,
+            exit_velo, leverage = round(leverage, 2),
+            wpa = round(wpa, 3), score) %>%
+  head(10) %>%
+  kbl_or_note("Clutch Contact — hardest hit when it mattered most")
+```
+
+## Pitching
+
+### Radar Gun Live
+
+```{r}
+
+radar <- pitches %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarise(max_velo = max(pitch_velo), avg_velo = round(mean(pitch_velo), 1),
+            p90 = round(quantile(pitch_velo, 0.90), 1), pitches = n(),
+            team = first(team), .groups = "drop") %>%
+  filter(pitches >= scale_min(30)) %>%
+  arrange(desc(max_velo), desc(avg_velo))
+
+radar %>% head(10) %>%
+  kbl_or_note("Radar Gun Live — pitch velocity leaders")
+```
+
+<div class="metric-note">
+Readings above 103 mph are dropped during extraction as single-frame tracking
+spikes — the raw data contains a 193 mph artifact that would otherwise poison
+both the leaderboard and every percentile built from it.
+</div>
+
+### Velocity Heartbeat
+
+Does a starter hold his gas? Per-pitch velocity with a rolling average.
+
+```{r}
+
+# Take the pitcher who threw the most pitches in a single game
+# Drop unmatched pitchers first -- a play missing from the lineup key comes
+# back as NA, and an NA name would end up in the chart title
+heartbeat_pick <- pitches %>%
+  filter(!is.na(player)) %>%
+  count(game_string, player, sort = TRUE) %>%
+  slice(1)
+
+hb_name <- if (nrow(heartbeat_pick) > 0) heartbeat_pick$player else "no pitcher found"
+
+heartbeat <- pitches %>%
+  filter(game_string == heartbeat_pick$game_string,
+         player == heartbeat_pick$player) %>%
+  arrange(play) %>%
+  mutate(pitch_no = row_number(),
+         # trailing 10-pitch average, written out rather than pulling in zoo
+         rolling = sapply(seq_len(n()), function(i) {
+           w <- pitch_velo[max(1, i - 9):i]
+           if (length(w) >= 3) mean(w) else NA_real_
+         }))
+
+ggplot(heartbeat, aes(pitch_no)) +
+  geom_point(aes(y = pitch_velo), colour = "grey60", size = 1.6) +
+  geom_line(aes(y = rolling), colour = GOLD, linewidth = 1.2, na.rm = TRUE) +
+  labs(title = paste0("Velocity Heartbeat — ", hb_name),
+       subtitle = "Grey points are individual pitches; the line is a 10-pitch average",
+       x = "Pitch number", y = "Velocity (mph)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r}
+
+first10 <- mean(head(heartbeat$pitch_velo, 10))
+last10  <- mean(tail(heartbeat$pitch_velo, 10))
+
+tibble(metric = c("Pitches", "Average velocity", "First 10 average",
+                  "Last 10 average", "Velocity held"),
+       value = c(nrow(heartbeat), round(mean(heartbeat$pitch_velo), 1),
+                 round(first10, 1), round(last10, 1),
+                 round(last10 - first10, 1))) %>%
+  kbl_or_note("Velocity Heartbeat summary")
+```
+
+### Effective Velocity
+
+A pitcher who releases the ball closer to the plate shortens the flight and
+steals reaction time, so the ball plays faster than the gun says:
+
+$$EV_{\text{eff}} = v \times \frac{60.5 - \bar{e}}{60.5 - e}$$
+
+```{r}
+
+league_ext <- median(pitches$extension, na.rm = TRUE)
+
+eff_velo <- pitches %>%
+  filter(is.finite(extension), extension > 0, extension < 12) %>%
+  mutate(effective = round(pitch_velo * (RUBBER_FT - league_ext) /
+                             (RUBBER_FT - extension), 1),
+         gain = round(effective - pitch_velo, 1))
+
+eff_velo %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarise(avg_extension = round(mean(extension), 2),
+            avg_velo = round(mean(pitch_velo), 1),
+            avg_effective = round(mean(effective), 1),
+            gain = round(mean(gain), 1), pitches = n(), .groups = "drop") %>%
+  filter(pitches >= scale_min(30)) %>%
+  arrange(desc(gain)) %>%
+  head(10) %>%
+  kbl_or_note(paste0("Effective Velocity — league median extension is ",
+                       round(league_ext, 2), " ft"))
+```
+
+### Late Life
+
+<div class="metric-note">
+**Gravity is not movement.** Deviation from a straight line has two causes and
+only one is interesting: gravity drops a 90 mph pitch about 39 inches regardless
+of quality. Reporting that as break makes every pitch look filthy. Subtracting
+the $\tfrac{1}{2}gt^2$ component leaves **induced** vertical break — the
+aerodynamic part that actually separates pitch types.
+</div>
+
+```{r}
+
+movement <- pitches %>%
+  filter(is.finite(induced_break), is.finite(horizontal_break),
+         abs(induced_break) < 40, abs(horizontal_break) < 40) %>%
+  mutate(shape = case_when(induced_break > 12 ~ "riding fastball",
+                           induced_break > 6  ~ "fastball",
+                           induced_break > 0  ~ "cutter / changeup",
+                           TRUE               ~ "breaking ball"))
+
+ggplot(movement, aes(horizontal_break, induced_break, colour = shape)) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_vline(xintercept = 0, colour = "grey70") +
+  geom_point(alpha = 0.25, size = 1) +
+  labs(title = "Late Life — pitch movement with gravity removed",
+       x = "Horizontal break (inches)", y = "Induced vertical break (inches)",
+       colour = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top")
+```
+
+```{r}
+
+movement %>%
+  group_by(shape) %>%
+  summarise(pitches = n(), avg_velo = round(mean(pitch_velo), 1),
+            avg_ivb = round(mean(induced_break), 1),
+            avg_hb = round(mean(horizontal_break), 1), .groups = "drop") %>%
+  arrange(desc(avg_ivb)) %>%
+  kbl_or_note("Late Life — pitch shapes separated by induced break")
+```
+
+## Defense & Fielding
+
+### The Robbery Meter
+
+**METHOD:** Three physically meaningful features, engineered from tracking:
+how far the fielder had to travel (`route`), how long the ball was in the air
+(`hang`), and the closing speed those two imply. Route and hang are the physics;
+their ratio is what separates a routine fly from a highlight.
+
+```{r}
+
+catch_data <- catches %>%
+  filter(hang > 0.4, route >= 0, route < 160) %>%
+  mutate(required_speed = pmin(route / hang, 45))
+
+catch_model <- glm(catch_made ~ route + hang + required_speed,
+                   family = binomial(), data = catch_data)
+
+catch_data <- catch_data %>%
+  mutate(catch_prob = as.numeric(predict(catch_model, type = "response")),
+         oae = catch_made - catch_prob,
+         robbery = if_else(catch_made == 1, 100 * (1 - catch_prob), 0),
+         # a play is most fun to vote on when the model is least sure
+         suspense = 1 - abs(2 * (catch_prob - 0.5)))
+
+catch_acc <- round(mean((catch_data$catch_prob >= 0.5) == (catch_data$catch_made == 1)), 3)
+
+tibble(metric = c("Catch opportunities", "Base catch rate", "Accuracy", "Brier score"),
+       value = c(comma(nrow(catch_data)), round(mean(catch_data$catch_made), 3),
+                 catch_acc,
+                 round(mean((catch_data$catch_prob - catch_data$catch_made)^2), 3))) %>%
+  kbl_or_note("Robbery Meter — catch probability model")
+```
+
+```{r}
+
+# The model as a fan would read it
+grid <- expand_grid(route = seq(0, 130, 2), hang = c(2, 3, 4, 5)) %>%
+  mutate(required_speed = pmin(route / hang, 45))
+grid$catch_prob <- as.numeric(predict(catch_model, grid, type = "response"))
+
+ggplot(grid, aes(route, catch_prob, colour = factor(hang))) +
+  geom_line(linewidth = 1.2) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "The Robbery Meter",
+       subtitle = "A 60 ft route is routine with 5 seconds of hang time, a coin flip with 3",
+       x = "Route distance (feet)", y = "Catch probability",
+       colour = "Hang time (s)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top")
+```
+
+```{r}
+
+# Outs Above Expected: catches made beyond what an average defender makes
+oae <- catch_data %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarise(chances = n(), made = sum(catch_made),
+            expected = round(sum(catch_prob), 1), oae = round(sum(oae), 2),
+            pos = first(pos), team = first(team), .groups = "drop") %>%
+  filter(chances >= scale_min(12)) %>%
+  arrange(desc(oae))
+
+oae %>% head(10) %>%
+  kbl_or_note("Outs Above Expected — the best gloves in the league")
+```
+
+### Web Gem of the Game
+
+Every completed catch carries a Robbery Score of $100\times(1-P)$. Sorting by it
+surfaces the season's most improbable play automatically.
+
+```{r}
+
+web_gems <- catch_data %>%
+  filter(catch_made == 1, !is.na(player)) %>%
+  arrange(catch_prob) %>%
+  transmute(game = game_string, play, player, pos, route, hang,
+            catch_prob = round(catch_prob, 3), robbery = round(robbery, 1))
+
+web_gems %>% head(10) %>%
+  kbl_or_note("Web Gems — the least likely catches of the season")
+```
+
+### Outfield Cannons
+
+```{r}
+
+cannons <- throws %>%
+  filter(!is.na(player)) %>%
+  group_by(player) %>%
+  summarise(max_throw = max(throw_velo), avg_throw = round(mean(throw_velo), 1),
+            throws = n(), pos = first(pos), team = first(team), .groups = "drop") %>%
+  filter(throws >= scale_min(3)) %>%
+  arrange(desc(max_throw))
+
+cannons %>% head(10) %>%
+  kbl_or_note("Outfield Cannons — arm strength")
+```
+
+### Ground Crew Range
+
+```{r}
+
+range_lb <- catch_data %>%
+  filter(catch_made == 1, !is.na(player)) %>%
+  group_by(player) %>%
+  summarise(avg_route = round(mean(route), 1), max_route = max(route),
+            top_closing = round(max(closing, na.rm = TRUE) * MPH, 1),
+            efficiency = round(mean(efficiency, na.rm = TRUE), 3),
+            catches = n(), pos = first(pos), .groups = "drop") %>%
+  filter(catches >= scale_min(8)) %>%
+  arrange(desc(avg_route))
+
+range_lb %>% head(10) %>%
+  kbl_or_note("Ground Crew Range — ground covered per catch")
+```
+
+### Double-Play Ballet
+
+Pivot time: glove to release for the middle infielder on the turn.
+
+```{r}
+
+pivot_summary <- pivots %>%
+  group_by(pos) %>%
+  summarise(turns = n(), fastest = min(pivot), avg = round(mean(pivot), 2),
+            .groups = "drop")
+
+kbl_or_note(pivot_summary, "Double-Play Ballet — pivot time by position",
+            "No double-play turns in this sample — raise N_TRACK_GAMES.")
+```
+
+### Pop-Time Pipeline
+
+```{r}
+
+pop_summary <- if (nrow(pops) == 0) pops else {
+  pops %>%
+    summarise(attempts = n(), fastest_exchange = min(exchange),
+              avg_exchange = round(mean(exchange), 2),
+              avg_throw = round(mean(throw_velo, na.rm = TRUE), 1),
+              hardest_throw = round(max(throw_velo, na.rm = TRUE), 1))
+}
+
+kbl_or_note(pop_summary, "Pop-Time Pipeline — catcher exchange and throw",
+            "No throws to second in this sample — raise N_TRACK_GAMES.")
+```
+
+## Fan-Interactive Games
+
+<div class="metric-note">
+**The design rule:** a question is only worth asking when the answer is
+genuinely uncertain. A prompt the crowd gets right 95% of the time is a
+formality, not a game — so every selector below ranks candidates by
+**suspense**, not by size.
+</div>
+
+### Catch or No Catch?
+
+```{r}
+
+vote_catch <- catch_data %>%
+  filter(catch_prob >= 0.25, catch_prob <= 0.75) %>%
+  arrange(desc(suspense)) %>%
+  transmute(game = game_string, play, fielder = pos, route, hang,
+            catch_prob = round(catch_prob, 3),
+            answer = if_else(catch_made == 1, "CAUGHT", "DROPS"),
+            suspense = round(suspense, 3))
+
+vote_catch %>% head(8) %>%
+  kbl_or_note("Catch or No Catch? — plays the model is least sure about")
+```
+
+### Out or Safe?
+
+A bang-bang play at first: compare when the throw would arrive against when the
+runner did.
+
+```{r}
+
+close_plays <- throws %>%
+  select(game_string, play, fielder_id, throw_velo, transfer) %>%
+  inner_join(runs %>% select(game_string, play, time_to_first, sprint_mph),
+             by = c("game_string", "play")) %>%
+  filter(is.finite(time_to_first), is.finite(throw_velo)) %>%
+  # rough flight time of the throw from the infield to the bag
+  mutate(throw_time = 90 / (throw_velo / MPH),
+         margin = round(time_to_first - (transfer + throw_time), 3),
+         verdict = if_else(margin < 0, "SAFE", "OUT")) %>%
+  arrange(abs(margin))
+
+close_plays %>%
+  transmute(game = game_string, play, sprint_mph, time_to_first,
+            throw_velo, margin, verdict) %>%
+  head(8) %>%
+  kbl_or_note("Out or Safe? — the tightest races at first base")
+```
+
+### Guess the Gun
+
+```{r}
+
+guess_gun <- pitches %>%
+  filter(pitch_velo >= 95) %>%
+  arrange(desc(pitch_velo)) %>%
+  mutate(low = floor(pitch_velo / 3) * 3 - 3,
+         option_a = paste0(low, "-", low + 2),
+         option_b = paste0(low + 3, "-", low + 5),
+         option_c = paste0(low + 6, "-", low + 8),
+         answer = case_when(pitch_velo < low + 3 ~ option_a,
+                            pitch_velo < low + 6 ~ option_b,
+                            TRUE ~ option_c))
+
+guess_gun %>%
+  transmute(game = game_string, play, pitcher = player,
+            option_a, option_b, option_c, actual = pitch_velo, answer) %>%
+  head(8) %>%
+  kbl_or_note("Guess the Gun — three buckets straddling the real reading")
+```
+
+### How Far Did It Go?
+
+```{r}
+
+how_far <- hits %>%
+  filter(carry >= 330) %>%
+  arrange(desc(carry)) %>%
+  mutate(low = floor(carry / 25) * 25 - 25,
+         option_a = paste0(low, "-", low + 24, " ft"),
+         option_b = paste0(low + 25, "-", low + 49, " ft"),
+         option_c = paste0(low + 50, "+ ft"),
+         answer = case_when(carry < low + 25 ~ option_a,
+                            carry < low + 50 ~ option_b,
+                            TRUE ~ option_c))
+
+how_far %>%
+  transmute(game = game_string, play, batter = player, exit_velo,
+            option_a, option_b, option_c, actual = carry, answer) %>%
+  head(8) %>%
+  kbl_or_note("How Far Did It Go? — 25-foot buckets")
+```
+
+### Beat the Burner
+
+The target is how long the runner needed to cover 90 feet at his peak speed.
+
+```{r}
+
+beat_burner <- runs %>%
+  filter(!is.na(player)) %>%
+  arrange(desc(sprint_mph)) %>%
+  mutate(target_seconds = round(90 / (sprint_mph / MPH), 2),
+         league_pct = round(100 * percent_rank(sprint_mph), 1))
+
+beat_burner %>%
+  transmute(game = game_string, play, runner = player, sprint_mph,
+            target_seconds, league_pct) %>%
+  head(8) %>%
+  kbl_or_note("Beat the Burner — can a fan tap faster than he runs?")
+```
+
+## Composite & Storytelling
+
+### Five-Tool Scoreboard
+
+Speed, power and arm are measured in different things, so each is converted to a
+**league percentile first** and then averaged. That makes the blend honest and
+the output instantly legible: 97 means better than 97% of the league.
+
+```{r}
+
+five_tool <- burner %>%
+  select(player, speed = top_mph) %>%
+  full_join(smash %>% select(player, power = max_ev), by = "player") %>%
+  full_join(cannons %>% select(player, arm = max_throw), by = "player") %>%
+  mutate(speed_pct = round(100 * percent_rank(speed), 1),
+         power_pct = round(100 * percent_rank(power), 1),
+         arm_pct   = round(100 * percent_rank(arm), 1),
+         tools = as.integer(!is.na(speed_pct)) + as.integer(!is.na(power_pct)) +
+                 as.integer(!is.na(arm_pct)),
+         score = round(rowMeans(cbind(speed_pct, power_pct, arm_pct), na.rm = TRUE), 1),
+         team = str_split_i(player, "-", 1)) %>%
+  filter(tools >= 2) %>%
+  arrange(desc(score))
+
+five_tool %>% head(10) %>%
+  select(player, team, speed, power, arm, speed_pct, power_pct, arm_pct, tools, score) %>%
+  kbl_or_note("Five-Tool Scoreboard — percentile blend of speed, power and arm")
+```
+
+### Player of the Game Engine
+
+Not a box score line — a **win probability** line. Batters are credited with
+their WPA; pitchers with the negative of the WPA they allowed.
+
+```{r}
+
+potg <- bind_rows(
+  pbp %>% group_by(game_string, player = batter) %>%
+    summarise(role = "batting", pa = n(), wpa = sum(wpa),
+              hits = sum(outcome %in% c("single","double","triple","home_run")),
+              rbi = sum(runs), .groups = "drop"),
+  pbp %>% group_by(game_string, player = pitcher) %>%
+    summarise(role = "pitching", pa = n(), wpa = -sum(wpa),
+              hits = NA_integer_, rbi = NA_integer_, .groups = "drop")) %>%
+  mutate(score = round(100 * wpa, 1)) %>%
+  arrange(desc(wpa))
+
+potg %>% head(10) %>%
+  transmute(game = game_string, player, role, pa, wpa = round(wpa, 3), score) %>%
+  kbl_or_note("Player of the Game — biggest single-game win contributions")
+```
+
+### Rivalry Radar
+
+```{r}
+
+rivalry <- pbp %>%
+  left_join(hits %>% select(game_string, play, exit_velo),
+            by = c("game_string", "last_play" = "play")) %>%
+  group_by(team = batting_team) %>%
+  summarise(games = n_distinct(game_string), pa = n(),
+            runs_per_game = round(sum(runs) / n_distinct(game_string), 2),
+            hr = sum(outcome == "home_run"),
+            avg_exit_velo = round(mean(exit_velo, na.rm = TRUE), 1),
+            high_leverage_pa = sum(leverage >= 2),
+            .groups = "drop") %>%
+  arrange(desc(runs_per_game))
+
+rivalry %>% head(12) %>%
+  kbl_or_note("Rivalry Radar — team tale of the tape from tracking")
+```
+
+### Prospect Spotlight
+
+```{r}
+
+spotlight_player <- five_tool$player[1]
+
+tibble(tool = c("Speed", "Power", "Arm"),
+       value = c(five_tool$speed[1], five_tool$power[1], five_tool$arm[1]),
+       percentile = c(five_tool$speed_pct[1], five_tool$power_pct[1],
+                      five_tool$arm_pct[1])) %>%
+  mutate(grade = case_when(percentile >= 97 ~ "ELITE",
+                           percentile >= 85 ~ "PLUS-PLUS",
+                           percentile >= 70 ~ "PLUS",
+                           percentile >= 45 ~ "AVERAGE",
+                           TRUE ~ "BELOW AVG")) %>%
+  kbl_or_note(paste0("Prospect Spotlight — ", spotlight_player))
+```
+
+# Part 4 — The Play Explorer
+
+Everything above is a leaderboard. This is the scoreboard: pick a play from the
+win-probability chart and watch it happen, with its metrics underneath.
+
+```{r explorer-games}
+
+# Tracking for a whole season is far too large to embed, so the explorer only
+# carries games we actually extracted -- ranked by drama, the biggest single
+# swing in each -- and at most three of them.
+explorer_games <- pbp %>%
+  filter(game_string %in% track_games) %>%
+  group_by(game_string) %>%
+  summarise(drama = max(abs(wpa)), .groups = "drop") %>%
+  arrange(desc(drama)) %>%
+  head(min(3, length(track_games))) %>%
+  pull(game_string)
+
+explorer_pbp <- pbp %>% filter(game_string %in% explorer_games)
+```
+
+```{r explorer-tracking}
+
+# Frames for the plays we can replay, trimmed to the live ball and rounded to a
+# tenth of a foot -- finer precision is invisible on screen and triples the size
+build_frames <- function(gs) {
+
+  keep <- explorer_pbp %>% filter(game_string == gs) %>% pull(last_play)
+
+  bp <- ball_positions %>% filter(game_string == gs) %>% collect() %>%
+    mutate(across(everything(), as.numeric)) %>% filter(play_per_game %in% keep)
+  pp <- player_positions %>% filter(game_string == gs) %>% collect() %>%
+    mutate(across(everything(), as.numeric)) %>%
+    filter(play_per_game %in% keep, player_id <= 13)
+  ev <- ball_events %>% filter(game_string == gs) %>% collect() %>%
+    mutate(across(c(play_per_game, timestamp, ball_eventcode), as.numeric)) %>%
+    filter(play_per_game %in% keep)
+
+  out <- list()
+  for (pl in keep) {
+    b <- bp %>% filter(play_per_game == pl) %>% arrange(timestamp)
+    if (nrow(b) < 2) next
+    e <- ev %>% filter(play_per_game == pl)
+
+    t0 <- if (any(e$ball_eventcode == EV[["PITCH"]])) {
+      min(e$timestamp[e$ball_eventcode == EV[["PITCH"]]]) - 400
+    } else min(b$timestamp)
+    t1 <- if (any(e$ball_eventcode == EV[["END"]])) {
+      max(e$timestamp[e$ball_eventcode == EV[["END"]]]) + 800
+    } else max(b$timestamp)
+
+    b <- b %>% filter(timestamp >= t0, timestamp <= t1)
+    if (nrow(b) < 2) next
+    ts <- b$timestamp
+
+    players <- list()
+    for (pid in sort(unique(pp$player_id[pp$play_per_game == pl]))) {
+      trk <- pp %>% filter(play_per_game == pl, player_id == pid) %>%
+        arrange(timestamp)
+      if (nrow(trk) < 2) next
+      players[[as.character(pid)]] <- list(
+        x = round(approx(trk$timestamp, trk$field_x, ts, rule = 2)$y, 1),
+        y = round(approx(trk$timestamp, trk$field_y, ts, rule = 2)$y, 1))
+    }
+
+    out[[as.character(pl)]] <- list(
+      t  = round(ts - ts[1]),
+      bx = round(b$ball_position_x, 1),
+      by = round(b$ball_position_y, 1),
+      bz = round(b$ball_position_z, 1),
+      players = players,
+      marks = e %>%
+        filter(ball_eventcode %in% c(1, 2, 3, 4, 5, 10, 11, 16)) %>%
+        transmute(t = round(timestamp - ts[1]), code = ball_eventcode))
+  }
+  out
+}
+
+frames <- cached("explorer_frames", {
+  setNames(lapply(explorer_games, build_frames), explorer_games)
+})
+```
+
+```{r explorer-payload}
+
+# Join every metric we computed onto the plays the explorer can show
+explorer_rows <- explorer_pbp %>%
+  left_join(hits %>% select(game_string, play, exit_velo, launch, carry, barrel),
+            by = c("game_string", "last_play" = "play")) %>%
+  left_join(pitches %>% select(game_string, play, pitch_velo, extension,
+                               induced_break, horizontal_break),
+            by = c("game_string", "last_play" = "play")) %>%
+  left_join(runs %>% select(game_string, play, sprint_mph, time_to_first, burst),
+            by = c("game_string", "last_play" = "play")) %>%
+  left_join(catch_data %>% select(game_string, play, pos, route, hang,
+                                  catch_prob, robbery),
+            by = c("game_string", "last_play" = "play")) %>%
+  left_join(throws %>% select(game_string, play, throw_velo, transfer),
+            by = c("game_string", "last_play" = "play")) %>%
+  mutate(wp_home = if_else(half_inning == "Bottom", wp_after, 1 - wp_after))
+
+# Every pitch thrown in each at-bat, for the tunnel view. A play is one pitch,
+# so the at-bat's pitches are the plays between its first and last.
+pitch_seq <- explorer_pbp %>%
+  # key_play is made with mutate, not select. Naming a column twice in one
+  # select() -- once renamed, once not -- keeps only one of them, and the
+  # other silently disappears.
+  mutate(key_play = last_play) %>%
+  select(game_string, key_play, first_play, last_play) %>%
+  inner_join(pitches %>% select(game_string, play, pitch_velo, plate_x, plate_z,
+                                induced_break, horizontal_break),
+             by = "game_string", relationship = "many-to-many") %>%
+  filter(play >= first_play, play <= last_play,
+         !is.na(plate_x), !is.na(plate_z)) %>%
+  arrange(game_string, key_play, play) %>%
+  group_by(game_string, key_play) %>%
+  mutate(pitch_no = row_number()) %>%
+  ungroup()
+
+# Keyed "game play" so the browser can look up an at-bat's pitches directly
+pitch_map <- split(pitch_seq, paste(pitch_seq$game_string, pitch_seq$key_play))
+pitch_map <- lapply(pitch_map, function(d) {
+  d %>% transmute(n = pitch_no, x = round(plate_x, 3), z = round(plate_z, 3),
+                  velo = pitch_velo, ivb = induced_break, hb = horizontal_break)
+})
+
+# Strike zone, calibrated from where pitches actually cross rather than assumed
+# (z = 0 in this coordinate system is a datum, not the ground)
+zone_src <- pitches %>% filter(!is.na(plate_z))
+
+zone <- if (nrow(zone_src) >= 50) {
+  list(bottom = round(unname(quantile(zone_src$plate_z, 0.12)), 2),
+       top    = round(unname(quantile(zone_src$plate_z, 0.88)), 2),
+       half_width = 0.83)
+} else {
+  # too few tracked crossings to calibrate; fall back to a nominal zone
+  list(bottom = 1.5, top = 3.4, half_width = 0.83)
+}
+
+payload <- list(
+  games = lapply(explorer_games, function(g) {
+    m <- game_info %>% filter(game_string == g) %>% slice(1)
+    list(id = g, home = m$home_team, away = m$away_team)
+  }),
+  zone = zone,
+  pitch_map = pitch_map,
+  plays = explorer_rows %>%
+    transmute(game = game_string, play = last_play, inning, half = half_inning,
+              batter, pitcher, outcome, runs, outs = outs_before,
+              bases = BASE_LABELS[base_state + 1],
+              home_score, away_score, situation,
+              wpa = round(wpa, 4), leverage = round(leverage, 2),
+              wp_home = round(wp_home, 4), clutch = round(clutch, 1),
+              exit_velo, launch, carry, barrel,
+              pitch_velo, extension, induced_break, horizontal_break,
+              sprint_mph, time_to_first, burst,
+              fielder = pos, route, hang,
+              catch_prob = round(catch_prob, 3), robbery = round(robbery, 1),
+              throw_velo, transfer),
+  frames = frames)
+
+payload_json <- toJSON(payload, auto_unbox = TRUE, na = "null", digits = 4)
+```
+
+```{r explorer, echo=FALSE, output="asis"}
+
+# Everything below is emitted inside a ```{=html} raw block. Without it Pandoc
+# treats any line indented four spaces as a markdown code block, which prints
+# the buttons as source text instead of rendering them.
+cat('```{=html}\n')
+
+cat('<style>
+.ex{background:#12181f;color:#fff;border-radius:12px;padding:14px;
+font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.ex-filters{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.ex-filters select{background:#22303f;color:#fff;border:0;border-radius:7px;
+padding:7px 10px;font-size:13px}
+.ex-panel{background:#161f2b;border-radius:10px;padding:10px;margin-bottom:12px}
+.ex-panel h4{margin:0 0 8px;font-size:11px;letter-spacing:1.2px;color:#9fb0c0;
+text-transform:uppercase}
+.ex-two{display:grid;grid-template-columns:1.25fr 1fr;gap:12px}
+@media(max-width:900px){.ex-two{grid-template-columns:1fr}}
+.ex-ctrl{display:flex;gap:7px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.ex-btn{background:#22303f;color:#fff;border:0;border-radius:7px;padding:6px 12px;
+font-weight:700;font-size:12px;cursor:pointer}
+.ex-btn.go{background:#f5c518;color:#000}
+.ex-narr{font-size:14px;margin:8px 0 4px}
+.ex-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+gap:10px}
+.ex-card{background:#161f2b;border-radius:10px;padding:10px}
+.ex-card h5{margin:0 0 8px;font-size:10.5px;letter-spacing:1px;color:#f5c518;
+text-transform:uppercase}
+.ex-kv{display:flex;justify-content:space-between;font-size:12.5px;
+padding:3px 0;border-bottom:1px solid #22303f}
+.ex-kv span:last-child{font-weight:700}
+.ex-legend{font-size:10.5px;color:#7d8fa1;margin-top:6px}
+</style>')
+
+cat('<div class="ex">
+<div class="ex-filters">
+<select id="ex-game"></select>
+<select id="ex-type"><option value="">All play types</option></select>
+<select id="ex-player"><option value="">All batters</option></select>
+</div>
+
+<div class="ex-panel">
+<h4>Win probability added &mdash; every play marked, click one</h4>
+<svg id="ex-chart" viewBox="0 0 900 300" style="width:100%;height:auto"></svg>
+<div class="ex-legend">Line is the home team&rsquo;s win probability. Each dot is a
+plate appearance, sized by how much it moved the game and coloured by which side
+it helped. Bars underneath are Leverage Index.</div>
+</div>
+
+<div class="ex-two">
+<div class="ex-panel"><h4 id="ex-title">Field replay</h4>
+<svg id="ex-field" viewBox="0 0 560 430" style="width:100%;height:auto"></svg>
+<div class="ex-ctrl">
+<button class="ex-btn go" id="ex-play">&#9654; Play</button>
+<button class="ex-btn" id="ex-prev">&#9664; Prev</button>
+<button class="ex-btn" id="ex-next">Next &#9654;</button>
+<input type="range" id="ex-scrub" min="0" max="1000" value="0" style="flex:1">
+<span id="ex-clock" style="color:#9fb0c0;font-size:11px"></span>
+</div>
+<div class="ex-narr" id="ex-narr"></div>
+</div>
+
+<div class="ex-panel"><h4>Pitch tunnel &mdash; catcher&rsquo;s view</h4>
+<svg id="ex-tunnel" viewBox="0 0 420 360" style="width:100%;height:auto"></svg>
+<div class="ex-legend" id="ex-tunnel-note"></div>
+</div>
+</div>
+
+<div class="ex-cards" id="ex-cards"></div>
+</div>')
+
+cat(paste0('<script>\nconst EX = ', payload_json, ';\n'))
+
+cat('
+const g = function(i){ return document.getElementById(i); };
+let rows = [], sel = 0, t = 0, timer = null;
+
+// Build an SVG element with every attribute quoted.
+//
+// This matters more than it looks: writing tags by hand as
+//   "<rect width="+w+" rx=8/>"
+// produces rx="8/" -- the slash is swallowed into the attribute value, the tag
+// never closes, and every element after it becomes a child of the rect. SVG
+// does not render those, so the whole panel silently goes blank.
+function el(tag, attrs, inner){
+  let s = "<" + tag;
+  for (const k in attrs) {
+    if (attrs[k] !== null && attrs[k] !== undefined) {
+      s += " " + k + "=\\"" + attrs[k] + "\\"";
+    }
+  }
+  return (inner === undefined || inner === null)
+    ? s + "></" + tag + ">"
+    : s + ">" + inner + "</" + tag + ">";
+}
+
+// ---- filters -------------------------------------------------------------
+EX.games.forEach(function(gm){
+  const o = document.createElement("option");
+  o.value = gm.id; o.textContent = gm.away + " at " + gm.home;
+  g("ex-game").appendChild(o);
+});
+if (EX.games.length) g("ex-game").value = EX.games[0].id;
+
+[...new Set(EX.plays.map(function(p){ return p.outcome; }))].sort().forEach(function(v){
+  const o = document.createElement("option");
+  o.value = v; o.textContent = String(v).replace(/_/g," ");
+  g("ex-type").appendChild(o);
+});
+
+function refreshPlayers(){
+  const gm = g("ex-game").value;
+  const names = [...new Set(EX.plays.filter(function(p){ return p.game === gm; })
+                                    .map(function(p){ return p.batter; }))].sort();
+  g("ex-player").innerHTML = "<option value=\\"\\">All batters</option>" +
+    names.map(function(n){ return "<option>" + n + "</option>"; }).join("");
+}
+
+function applyFilters(){
+  const gm = g("ex-game").value, ty = g("ex-type").value, pl = g("ex-player").value;
+  rows = EX.plays.filter(function(p){
+    return p.game === gm && (!ty || p.outcome === ty) && (!pl || p.batter === pl);
+  });
+  sel = 0; t = 0; stop(); render();
+}
+
+// ---- win probability chart, every play marked ----------------------------
+function drawChart(){
+  const W = 900, H = 300, top = 24, mid = 196, bot = 288;
+  const all = EX.plays.filter(function(p){ return p.game === g("ex-game").value; });
+  const n = Math.max(1, all.length - 1);
+  const x = function(k){ return 34 + (k/n)*(W-58); };
+  const y = function(v){ return mid - v*(mid-top); };
+  let s = "";
+
+  s += el("rect", {width:W, height:H, fill:"#0f1620", rx:8});
+
+  // 50% reference and axis labels
+  s += el("line", {x1:34, y1:y(0.5), x2:W-24, y2:y(0.5),
+                   stroke:"#3a4a5c", "stroke-dasharray":"4 4"});
+  [0, 0.5, 1].forEach(function(v){
+    s += el("text", {x:28, y:y(v)+4, fill:"#6b7c8d", "font-size":10,
+                     "text-anchor":"end"}, Math.round(v*100) + "%");
+  });
+
+  // inning separators
+  let prev = null;
+  all.forEach(function(p,k){
+    const key = p.inning + p.half;
+    if (key !== prev && p.half === "Top") {
+      s += el("line", {x1:x(k), y1:top, x2:x(k), y2:mid, stroke:"#1e2b3a"});
+      s += el("text", {x:x(k)+3, y:top+10, fill:"#4a5b6c", "font-size":9}, p.inning);
+    }
+    prev = key;
+  });
+
+  // win probability path
+  let d = "";
+  all.forEach(function(p,k){
+    if (p.wp_home === null || p.wp_home === undefined) return;
+    d += (d ? "L" : "M") + x(k).toFixed(1) + "," + y(p.wp_home).toFixed(1);
+  });
+  if (d) s += el("path", {d:d, fill:"none", stroke:"#ffffff", "stroke-width":2});
+
+  // leverage bars
+  const lmax = Math.max(2, ...all.map(function(p){ return p.leverage || 0; }));
+  all.forEach(function(p,k){
+    const h = ((p.leverage||0)/lmax)*(bot-mid-16);
+    s += el("rect", {x:x(k)-2, y:bot-h, width:4, height:Math.max(0,h),
+                     fill:(p.leverage>=2 ? "#c8102e" : "#2f4a68")});
+  });
+  s += el("text", {x:34, y:mid+22, fill:"#6b7c8d", "font-size":10}, "LEVERAGE");
+
+  // one dot per play, sized by |WPA| and coloured by who it helped
+  all.forEach(function(p,k){
+    if (p.wp_home === null || p.wp_home === undefined) return;
+    const w = p.wpa || 0;
+    const inView = rows.some(function(r){ return r.play === p.play; });
+    const isSel = rows.length && rows[sel].play === p.play;
+    s += el("circle", {
+      cx:x(k), cy:y(p.wp_home),
+      r: isSel ? 8 : (3 + Math.min(6, Math.abs(w)*22)),
+      fill: isSel ? "#f5c518" : (w >= 0 ? "#21d07a" : "#c8102e"),
+      stroke: isSel ? "#000000" : "#0f1620", "stroke-width": isSel ? 2 : 1,
+      opacity: inView ? 1 : 0.25,
+      style:"cursor:pointer",
+      onclick:"exJump(" + p.play + ")"
+    });
+  });
+
+  s += el("text", {x:34, y:16, fill:"#9fb0c0", "font-size":10},
+          "WIN PROBABILITY (" + (EX.games.find(function(gm){
+            return gm.id === g("ex-game").value; })||{home:""}).home + ")");
+  g("ex-chart").innerHTML = s;
+}
+
+// ---- field ---------------------------------------------------------------
+const VW = 560, VH = 430, MAXD = 420;
+function fx(v){ return VW/2 + (v/MAXD)*(VW/2-16); }
+function fy(v){ return VH-26 - (v/MAXD)*(VH-52); }
+const LBL = {1:"P",2:"C",3:"1B",4:"2B",5:"3B",6:"SS",7:"LF",8:"CF",9:"RF",
+             10:"BAT",11:"R1",12:"R2",13:"R3"};
+function colour(id){
+  id = +id;
+  if (id <= 2) return "#ffffff";
+  if (id <= 6) return "#8fd4ff";
+  if (id <= 9) return "#ffd54a";
+  return "#ff7a90";
+}
+
+function fieldBase(){
+  const H=[0,0], F=[63.64,63.64], S=[0,127.28], T=[-63.64,63.64];
+  const pt = function(p){ return fx(p[0]) + "," + fy(p[1]); };
+  let s = el("rect", {width:VW, height:VH, fill:"#0b6b3a", rx:8});
+
+  // outfield arc
+  s += el("path", {d:"M " + fx(-MAXD*0.72) + "," + fy(MAXD*0.72) +
+                      " A 300 300 0 0 1 " + fx(MAXD*0.72) + "," + fy(MAXD*0.72),
+                   fill:"none", stroke:"#ffffff", "stroke-width":1.2, opacity:0.7});
+  // infield dirt and basepaths
+  s += el("polygon", {points:[pt(H),pt(F),pt(S),pt(T)].join(" "),
+                      fill:"#8a5a2b", opacity:0.5});
+  s += el("polyline", {points:[pt(H),pt(F),pt(S),pt(T),pt(H)].join(" "),
+                       fill:"none", stroke:"#ffffff", "stroke-width":1.8});
+  // foul lines
+  [F,T].forEach(function(b){
+    const nn = Math.hypot(b[0],b[1]);
+    s += el("line", {x1:fx(0), y1:fy(0),
+                     x2:fx(b[0]/nn*MAXD*0.78), y2:fy(b[1]/nn*MAXD*0.78),
+                     stroke:"#ffffff", "stroke-width":1.3});
+  });
+  // bags and mound
+  [F,S,T].forEach(function(b){
+    s += el("rect", {x:fx(b[0])-3, y:fy(b[1])-3, width:6, height:6, fill:"#ffffff"});
+  });
+  s += el("circle", {cx:fx(0), cy:fy(60.5), r:8, fill:"#8a5a2b", stroke:"#ffffff"});
+  s += el("polygon", {points:[fx(0)+","+(fy(0)-5), (fx(0)+5)+","+fy(0),
+                              fx(0)+","+(fy(0)+5), (fx(0)-5)+","+fy(0)].join(" "),
+                      fill:"#ffffff"});
+  return s;
+}
+
+function track(){
+  if (!rows.length) return null;
+  const r = rows[sel];
+  const byGame = EX.frames[r.game];
+  return byGame ? byGame[String(r.play)] : null;
+}
+
+function drawField(){
+  const tr = track();
+  let s = fieldBase();
+
+  if (!tr) {
+    g("ex-field").innerHTML = s +
+      el("text", {x:18, y:26, fill:"#ffffff", "font-size":12},
+         "No tracking for this play");
+    return;
+  }
+
+  const T = tr.t, dur = T[T.length-1] || 1, ms = Math.min(t, dur);
+  let i = 0; while (i < T.length-1 && T[i+1] <= ms) i++;
+  const j = Math.min(i+1, T.length-1);
+  const span = (T[j]-T[i]) || 1, f = Math.max(0, Math.min(1,(ms-T[i])/span));
+  const lp = function(a,b){ return a + (b-a)*f; };
+
+  // ball trail so far
+  let d = "";
+  for (let k = 0; k <= i; k++) {
+    d += (k ? "L" : "M") + fx(tr.bx[k]).toFixed(1) + "," + fy(tr.by[k]).toFixed(1);
+  }
+  if (d) s += el("path", {d:d, fill:"none", stroke:"#ffffff", "stroke-width":1.4,
+                          opacity:0.6, "stroke-dasharray":"3 3"});
+
+  // fielders and runners
+  for (const pid in tr.players) {
+    const p = tr.players[pid];
+    const px = lp(p.x[i], p.x[j]), py = lp(p.y[i], p.y[j]);
+    s += el("circle", {cx:fx(px), cy:fy(py), r:6, fill:colour(pid),
+                       stroke:"#0a1017", "stroke-width":1.2});
+    s += el("text", {x:fx(px), y:fy(py)-9, fill:colour(pid), "font-size":8.5,
+                     "text-anchor":"middle", "font-weight":700}, LBL[pid] || pid);
+  }
+
+  // the ball, growing as it rises
+  const bx = lp(tr.bx[i], tr.bx[j]), by = lp(tr.by[i], tr.by[j]),
+        bz = lp(tr.bz[i], tr.bz[j]);
+  s += el("circle", {cx:fx(bx), cy:fy(by),
+                     r:(4 + Math.max(0, Math.min(9, bz))*0.55),
+                     fill:"#ffffff", stroke:"#c8102e", "stroke-width":1.4});
+
+  // Event caption -- only the most recent one in the window. Drawing every
+  // match stacks "PITCH" and "CONTACT" on top of each other at the start of
+  // a play, which is unreadable.
+  const names = {1:"PITCH",4:"CONTACT",2:"FIELDED",3:"THROW",5:"END OF PLAY",
+                 10:"OFF THE WALL",11:"HOME RUN",16:"BOUNCE"};
+  let caption = null;
+  (tr.marks||[]).forEach(function(m){
+    if (Math.abs(m.t-ms) < 240 && names[m.code]) caption = names[m.code];
+  });
+  if (caption) {
+    s += el("text", {x:VW/2, y:26, fill:"#f5c518", "font-size":16,
+                     "font-weight":800, "text-anchor":"middle"}, caption);
+  }
+
+  g("ex-field").innerHTML = s;
+  g("ex-clock").textContent = (ms/1000).toFixed(1) + "s";
+  g("ex-scrub").value = Math.round(1000*ms/dur);
+}
+
+// ---- pitch tunnel, catcher\'s view ----------------------------------------
+function drawTunnel(){
+  const TW = 420, TH = 360;
+  let s = el("rect", {width:TW, height:TH, fill:"#0f1620", rx:8});
+
+  const seq = rows.length
+    ? (EX.pitch_map[rows[sel].game + " " + rows[sel].play] || [])
+    : [];
+
+  // Show a tight window around the zone (+/- 1.7 ft wide, 0.9 to 3.9 ft high)
+  // so the strike zone fills the panel instead of floating in dead space.
+  const zx = function(v){ return TW/2 + (v/1.35)*(TW/2 - 45); };
+  const zz = function(v){ return TH - 52 - ((v-1.0)/2.7)*(TH-100); };
+
+  const zb = EX.zone.bottom, zt = EX.zone.top, hw = EX.zone.half_width;
+
+  // strike zone, drawn in thirds like a broadcast overlay
+  s += el("rect", {x:zx(-hw), y:zz(zt), width:zx(hw)-zx(-hw),
+                   height:zz(zb)-zz(zt), fill:"none", stroke:"#ffffff",
+                   "stroke-width":2});
+  [1,2].forEach(function(k){
+    const vx = -hw + (2*hw)*k/3, vz = zb + (zt-zb)*k/3;
+    s += el("line", {x1:zx(vx), y1:zz(zt), x2:zx(vx), y2:zz(zb),
+                     stroke:"#2f4257", "stroke-width":1});
+    s += el("line", {x1:zx(-hw), y1:zz(vz), x2:zx(hw), y2:zz(vz),
+                     stroke:"#2f4257", "stroke-width":1});
+  });
+  s += el("text", {x:TW/2, y:TH-24, fill:"#6b7c8d", "font-size":10,
+                   "text-anchor":"middle"}, "catcher\\u2019s view \\u2014 home plate");
+
+  if (!seq.length) {
+    s += el("text", {x:20, y:26, fill:"#7d8fa1", "font-size":12},
+            "No tracked pitches for this at-bat");
+    g("ex-tunnel").innerHTML = s;
+    g("ex-tunnel-note").textContent = "";
+    return;
+  }
+
+  const palette = ["#f5c518","#3d8bff","#21d07a","#c8102e","#a855f7",
+                   "#f2994a","#8fd4ff","#ff9ab0"];
+
+  // faint line through the sequence shows how the pitcher moved the hitter around
+  let d = "";
+  seq.forEach(function(p,k){
+    d += (k ? "L" : "M") + zx(p.x).toFixed(1) + "," + zz(p.z).toFixed(1);
+  });
+  s += el("path", {d:d, fill:"none", stroke:"#3a4a5c", "stroke-width":1,
+                   "stroke-dasharray":"3 3"});
+
+  seq.forEach(function(p,k){
+    const c = palette[k % palette.length];
+    s += el("circle", {cx:zx(p.x), cy:zz(p.z), r:13, fill:c,
+                       stroke:"#0a1017", "stroke-width":1.5, opacity:0.92});
+    s += el("text", {x:zx(p.x), y:zz(p.z)+4, "font-size":11, "font-weight":800,
+                     "text-anchor":"middle", fill:"#0a1017"}, p.n);
+  });
+
+  g("ex-tunnel").innerHTML = s;
+
+  // the sequence in words, pitch by pitch
+  g("ex-tunnel-note").innerHTML = seq.map(function(p){
+    const bits = ["#" + p.n];
+    if (p.velo != null) bits.push(p.velo + " mph");
+    if (p.ivb  != null) bits.push("IVB " + (p.ivb>0?"+":"") + Math.round(p.ivb) + "\\"");
+    return bits.join(" ");
+  }).join(" &nbsp;|&nbsp; ");
+}
+
+// ---- metric cards --------------------------------------------------------
+function kv(k,v,u){
+  if (v === null || v === undefined) return "";
+  return "<div class=\\"ex-kv\\"><span>" + k + "</span><span>" + v + (u||"") + "</span></div>";
+}
+function card(title, body){
+  return body ? "<div class=\\"ex-card\\"><h5>" + title + "</h5>" + body + "</div>" : "";
+}
+
+function drawCards(){
+  if (!rows.length) { g("ex-cards").innerHTML = ""; return; }
+  const p = rows[sel];
+  let h = "";
+
+  h += card("Situation",
+    kv("Inning", (p.half==="Top"?"Top ":"Bot ") + p.inning) +
+    kv("Outs", p.outs) + kv("Bases", p.bases) +
+    kv("Score", p.away_score + " - " + p.home_score));
+
+  h += card("Win Probability",
+    kv("WPA", (p.wpa>=0?"+":"") + (p.wpa*100).toFixed(1), "%") +
+    kv("Leverage", p.leverage, "x") + kv("Clutch", p.clutch, "/100"));
+
+  h += card("Speed &amp; Baserunning",
+    kv("Sprint speed", p.sprint_mph, " mph") +
+    kv("Home to first", p.time_to_first, " s") +
+    kv("Burst", p.burst, " ft/s2"));
+
+  h += card("Power &amp; Hitting",
+    kv("Exit velocity", p.exit_velo, " mph") +
+    kv("Launch angle", p.launch, "&deg;") +
+    kv("Carry", p.carry, " ft") +
+    kv("Barrel", p.barrel === 1 ? "YES" : (p.barrel === 0 ? "no" : null)));
+
+  h += card("Pitching",
+    kv("Pitch velocity", p.pitch_velo, " mph") +
+    kv("Extension", p.extension, " ft") +
+    kv("Induced break", p.induced_break, " in") +
+    kv("Horizontal break", p.horizontal_break, " in"));
+
+  h += card("Defense &amp; Fielding",
+    kv("Fielder", p.fielder) +
+    kv("Ground covered", p.route, " ft") +
+    kv("Hang time", p.hang, " s") +
+    kv("Catch probability",
+       p.catch_prob === null || p.catch_prob === undefined
+         ? null : (p.catch_prob*100).toFixed(0), "%") +
+    kv("Robbery score", p.robbery, "/100") +
+    kv("Throw velocity", p.throw_velo, " mph") +
+    kv("Transfer", p.transfer, " s"));
+
+  g("ex-cards").innerHTML = h;
+}
+
+// ---- render --------------------------------------------------------------
+function render(){
+  if (!rows.length) {
+    g("ex-narr").textContent = "No plays match these filters.";
+    g("ex-cards").innerHTML = "";
+    drawChart(); drawField(); drawTunnel();
+    return;
+  }
+  const p = rows[sel];
+  g("ex-title").textContent = p.situation;
+
+  let words = p.batter + " \\u2014 " + String(p.outcome).replace(/_/g," ");
+  if (p.runs > 0) words += ", " + p.runs + " in";
+  words += ". Win probability " + (p.wpa>=0?"+":"") + (p.wpa*100).toFixed(0) +
+           "%, leverage " + p.leverage + "x.";
+  g("ex-narr").textContent = words;
+
+  drawChart(); drawField(); drawTunnel(); drawCards();
+}
+
+function exJump(playId){
+  const k = rows.findIndex(function(r){ return r.play === playId; });
+  if (k >= 0) { sel = k; t = 0; stop(); render(); }
+}
+function stop(){
+  if (timer) { clearInterval(timer); timer = null; g("ex-play").innerHTML = "&#9654; Play"; }
+}
+
+g("ex-play").onclick = function(){
+  if (timer) { stop(); return; }
+  const tr = track(); if (!tr) return;
+  if (t >= tr.t[tr.t.length-1]) t = 0;
+  g("ex-play").innerHTML = "&#10074;&#10074; Pause";
+  timer = setInterval(function(){
+    const cur = track(); if (!cur) { stop(); return; }
+    t += 40;
+    if (t >= cur.t[cur.t.length-1]) { t = cur.t[cur.t.length-1]; drawField(); stop(); return; }
+    drawField();
+  }, 40);
+};
+g("ex-prev").onclick = function(){ if (sel > 0) { sel--; t = 0; stop(); render(); } };
+g("ex-next").onclick = function(){ if (sel < rows.length-1) { sel++; t = 0; stop(); render(); } };
+g("ex-scrub").oninput = function(e){
+  const tr = track(); if (!tr) return;
+  t = tr.t[tr.t.length-1] * (+e.target.value/1000);
+  drawField();
+};
+g("ex-game").onchange = function(){ refreshPlayers(); applyFilters(); };
+g("ex-type").onchange = applyFilters;
+g("ex-player").onchange = applyFilters;
+
+refreshPlayers();
+applyFilters();
+</script>')
+
+cat('\n```\n')
+```
+
+<span style="color:red">**HOW TO USE IT:**</span>
+
+Pick a game, narrow by play type or batter, then click anywhere on the win
+probability line. The field replays that play from the tracking data — all nine
+fielders, the runners and the ball, with the ball growing as it rises — and every
+metric computed in Part 3 appears in the cards below, grouped by category.
+
+# Closing Notes
+
+**What is deliberately not modelled.** The data contains no umpire calls, so
+there is no supervised called-strike probability. There are no stolen-base or
+caught-stealing labels, so Pickoff Jump reports measured lead distance instead
+of a steal probability. Spin rate cannot be recovered from positional tracking,
+so pitch movement is used instead. Inventing any of the three would have been
+easy and dishonest.
+
+**Known limitation.** Reaching on an error and a fielder's choice are
+indistinguishable from a single when the only signal is base occupancy, which is
+why hits run about 10% above the real rate. Every metric that depends on the
+distinction is affected in the same direction.
+
+**Reproducing this.** Set `SMT_DATA_ROOT` if the data is not in the parent
+folder, then `quarto render SMT_Data_Challenge_2026.qmd`.
+
+Two knobs in the **How much data to process** chunk control the cost:
+
+| | `N_TRACK_GAMES` | `N_MODEL_GAMES` | Roughly |
+|---|---|---|---|
+| Quick check | 1 | 25 | a minute |
+| Working draft | 25 | 250 | a few minutes |
+| Full season | 250 | 250 | ~40 minutes, then cached |
+
+`N_TRACK_GAMES` is the expensive one — it reads the 4.5 GB player-positions
+directory at about ten seconds a game, and prints each game as it goes.
+Leaderboard minimums scale with the sample automatically, so a one-game render
+still produces populated tables rather than empty ones.
+
+Results are cached per sample size in `cache/`, so raising a knob only pays for
+what it adds, and later renders finish in seconds. Delete `cache/` to force a
+rebuild.

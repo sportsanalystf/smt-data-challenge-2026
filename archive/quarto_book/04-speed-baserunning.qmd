@@ -1,0 +1,217 @@
+---
+title: "Component 4 — Speed & Baserunning"
+---
+
+Five scoreboard products, all built from the same 20 Hz player tracking:
+**Burner Board**, **Home-to-First Dash**, **Fastest Out of the Box**,
+**Extra-Base Instinct**, and **Pickoff Jump**.
+
+## Where the numbers come from
+
+Speed is finite-differenced from consecutive tracking frames. A single mistracked
+frame can produce an absurd instantaneous value, so peak speed is taken as a
+**high percentile rather than the maximum** — a runner who does it repeatedly
+outranks one lucky frame.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-speed-core
+#| eval: false
+frame_speed <- function(x, y, timestamp) {
+  dt <- diff(timestamp) / 1000
+  d  <- sqrt(diff(x)^2 + diff(y)^2)
+  ifelse(dt > 0, d / dt, NA_real_)
+}
+
+top_speed <- function(x, probs = 0.90) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(NA_real_)
+  unname(stats::quantile(x, probs = probs, na.rm = TRUE))
+}
+```
+
+### Python
+
+```{python}
+#| label: py-speed-core
+#| eval: false
+def top_speed(speeds, pct=90):
+    s = np.asarray(speeds, dtype=float)
+    s = s[np.isfinite(s)]
+    if s.size == 0:
+        return np.nan
+    return float(np.percentile(s, pct))
+```
+
+:::
+
+## Burner Board
+
+Peak sprint speed on the way to first, ranked across the league.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-burner
+#| eval: false
+source("../R/R04_speed_baserunning.R")
+
+board <- burner_board(sprints, lineups, min_runs = 3, top = 10)
+board
+plot_burner_board(board)
+```
+
+### Python
+
+```{python}
+#| label: py-burner
+#| eval: false
+from components import c03_tracking_features as c03, c04_speed_baserunning as c04
+from smtstory import dataio
+
+tabs = c03.load_feature_tables()
+lu = dataio.load_lineups()
+c04.burner_board(tabs["sprints"], lu, top=10)
+```
+
+:::
+
+| player | top speed (mph) | avg (mph) | runs | percentile |
+|---|---|---|---|---|
+| VAS-1487 | **22.76** | 16.91 | 114 | 100.0 |
+| OSW-0976 | 22.05 | 16.38 | 11 | 99.9 |
+| AVV-6439 | 22.01 | 18.81 | 6 | 99.8 |
+| VAS-5976 | 21.99 | 17.26 | 100 | 99.6 |
+
+![Burner Board](../outputs/figures/fig_burner_board.png)
+
+::: {.callout-note}
+League context: sprint speed averages 16.3 mph with a 90th percentile of
+19.6 mph across 11,726 tracked runs, so 22.8 mph is genuinely exceptional.
+:::
+
+## Home-to-First Dash
+
+Elapsed time from contact to the first-base bag — measured as the moment the
+runner enters a 4-foot radius of the bag, not estimated from speed.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-h2f
+#| eval: false
+home_to_first(runs_tbl, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-h2f
+#| eval: false
+c04.home_to_first(anatomy_rows, top=10)
+```
+
+:::
+
+Times are graded ELITE (< 4.2 s), PLUS (< 4.5 s) or AVERAGE — the same
+thresholds a scout uses, which is what makes the graphic legible.
+
+## Fastest Out of the Box
+
+Acceleration in the first 1.5 seconds, which is the window in which reaction and
+first step actually show up.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-burst
+#| eval: false
+compute_burst <- function(track, t_hit, window_ms = 1500) {
+  w  <- dplyr::filter(track, timestamp >= t_hit, timestamp <= t_hit + window_ms)
+  sp <- frame_speed(w$field_x, w$field_y, w$timestamp)
+  sp <- sp[is.finite(sp)]
+  (max(sp) - sp[1]) / (window_ms / 1000)
+}
+out_of_the_box(runs_tbl, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-burst
+#| eval: false
+c04.out_of_the_box(anatomy_rows, top=10)
+```
+
+:::
+
+## Extra-Base Instinct
+
+Top speed and path efficiency when a runner actually takes an extra base —
+filtered to plays the reconstruction scored as a double or triple.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-extra
+#| eval: false
+extra_base_instinct(pbp, sprints, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-extra
+#| eval: false
+c04.extra_base_instinct(pbp, tabs["sprints"], lu, top=10)
+```
+
+:::
+
+Path efficiency is straight-line distance ÷ actual distance travelled: 1.0 is a
+perfect line, and anything below about 0.9 on the bases is a wide turn.
+
+## Pickoff Jump
+
+::: {.callout-warning}
+## Scope: measured, not modelled
+
+The data flags pickoff attempts (`is_pickoff`) but records **no outcome**, and
+there are no stolen-base or caught-stealing labels anywhere in the dataset. A
+"steal success probability" would therefore be invented, not learned.
+
+This product reports what the tracking actually shows: the runner's **secondary
+lead distance** off the bag at the moment of the pitch, and his **burst**. Both
+are real measurements a fan can see confirmed on the replay.
+:::
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-pickoff
+#| eval: false
+pickoff_jump("y1_d122_IOL_VAS", lineups, top = 10)
+```
+
+### Python
+
+```{python}
+#| label: py-pickoff
+#| eval: false
+c04.pickoff_jump(game, lu, top=10)
+```
+
+:::

@@ -1,0 +1,239 @@
+---
+title: "Component 2 — Run Expectancy, Win Probability, Leverage and WPA"
+---
+
+## The situational layer
+
+Component 1 gave us game state. This component turns state into **meaning**: how
+much a moment is worth, and how much a play changed the game. Nothing here is
+imported from another league — the run-expectancy matrix and the win-probability
+model are both estimated from this season.
+
+## Run Expectancy
+
+$RE(\text{base state}, \text{outs})$ is the average number of runs a team scores
+from that state to the end of the half-inning. It is the basis of Expected Runs
+Added:
+
+$$RE24 = RE_{\text{after}} - RE_{\text{before}} + \text{runs scored}$$
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-re
+#| eval: false
+source("../R/R02_wpa_leverage.R")
+
+re_tbl <- fit_run_expectancy(pbp)
+run_expectancy_table(re_tbl)
+```
+
+### Python
+
+```{python}
+#| label: py-re
+#| eval: false
+from components import c02_wpa_leverage as c02
+
+re_model = c02.fit_run_expectancy(pbp)
+c02.run_expectancy_table(re_model)
+```
+
+:::
+
+| bases | 0 outs | 1 out | 2 outs |
+|---|---|---|---|
+| `___` | 0.584 | 0.319 | 0.122 |
+| `1__` | 0.939 | 0.537 | 0.221 |
+| `_2_` | 1.192 | 0.834 | 0.391 |
+| `12_` | 1.547 | 1.115 | 0.440 |
+| `__3` | 1.135 | 0.937 | 0.551 |
+| `1_3` | 1.874 | 1.427 | 0.620 |
+| `_23` | 1.889 | 1.550 | 0.537 |
+| `123` | 2.070 | 1.789 | 0.760 |
+
+The matrix is strictly decreasing in outs for all eight base states — the
+invariant any correct RE table must satisfy, and one the test suite checks.
+
+## Win Probability
+
+::: {.callout-note}
+## Why a model and not a lookup
+
+With 250 games, an (inning × base-out × score-margin) grid cannot be filled by
+counting. A lookup produces jagged, non-monotonic probabilities that look broken
+on a scoreboard. A logistic model with well-chosen features stays smooth and
+monotonic, which is what a fan-facing number has to be.
+:::
+
+Features and the reasoning behind each:
+
+| feature | why it is there |
+|---|---|
+| `score_diff` | the value of a lead |
+| `innings_left` | how much time remains to change it |
+| `score_diff × innings_left` | a lead is worth more as innings run out |
+| `re_state` | the run potential of the current base-out state |
+| `is_bottom` | the home team bats last |
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-wp
+#| eval: false
+wp_model <- fit_win_probability(pbp, re_tbl)
+wp_metrics(wp_model, pbp, re_tbl)
+```
+
+R uses `glm()` with a binomial family — the idiomatic choice, and identical in
+form to the hand-rolled gradient descent used on the Python side.
+
+### Python
+
+```{python}
+#| label: py-wp
+#| eval: false
+wp_model = c02.fit_win_probability(pbp, re_model)
+c02.wp_metrics(wp_model)
+```
+
+:::
+
+| metric | value |
+|---|---|
+| plate appearances | 18,834 |
+| accuracy | 0.774 |
+| Brier score | 0.144 |
+| log loss | 0.433 |
+| base rate | 0.517 |
+
+## Win Probability Added
+
+$$WPA = WP_{\text{after}} - WP_{\text{before}}$$
+
+The subtlety is the **half-inning flip**: after the third out the other team
+bats, so "the batting team" changes. When the sides change, the batting team's
+win probability becomes the *complement* of the next state's.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-wpa
+#| eval: false
+pbp <- add_wpa(pbp, wp_model, re_tbl)
+biggest_swings(pbp, n = 8)
+```
+
+### Python
+
+```{python}
+#| label: py-wpa
+#| eval: false
+enriched = c02.add_win_probability(pbp, wp_model, re_model)
+c02.biggest_swings(enriched, n=8)
+```
+
+:::
+
+The largest swings of the season are exactly what a human would pick:
+
+| inning | half | outcome | wp before | wp after | WPA |
+|---|---|---|---|---|---|
+| 11 | Bottom | home run | 0.144 | 0.970 | **+0.826** |
+| 9 | Bottom | out | 0.711 | 0.000 | **−0.711** |
+| 10 | Bottom | home run | 0.162 | 1.000 | **+0.838** |
+
+Walk-off home runs and game-ending outs — the model found them without being
+told what a walk-off is.
+
+## Leverage Index
+
+Leverage answers *how much can the game move from here?* Following the standard
+definition, it is the expected absolute win-probability swing from a state,
+normalized so an average plate appearance equals 1.0:
+
+$$LI(\text{state}) = \frac{E\left[\,|\Delta WP|\ \middle|\ \text{state}\right]}{E\left[\,|\Delta WP|\,\right]}$$
+
+We enumerate the plausible outcomes of a plate appearance with their league
+frequencies, apply each to the state with a small transition model, and average
+the resulting $|\Delta WP|$.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-li
+#| eval: false
+pbp <- add_leverage(pbp, wp_model, re_tbl)
+leverage_profile(pbp)
+```
+
+### Python
+
+```{python}
+#| label: py-li
+#| eval: false
+enriched, li = c02.add_leverage(enriched, wp_model, re_model)
+c02.leverage_profile(enriched)
+```
+
+:::
+
+| statistic | value |
+|---|---|
+| mean | **1.000** |
+| median | 0.889 |
+| p90 | 2.010 |
+| p95 | 2.620 |
+| max | 8.230 |
+| share above 2.0 | 0.102 |
+
+The mean of exactly 1.000 is by construction; the useful check is the shape —
+about 10 % of plate appearances are genuine high-leverage moments, and the
+maximum of 8.2 is in the right range for real baseball.
+
+::: {.callout-tip}
+## Performance
+
+Leverage needs one win-probability evaluation per possible outcome per plate
+appearance — roughly 113,000 model calls for a season. Evaluated row by row this
+took minutes; vectorized it takes about five seconds, which is what makes the
+metric usable on a live feed rather than only in post-processing.
+:::
+
+## Game flow
+
+The single most valuable storytelling graphic in baseball: where a game was won
+and lost.
+
+::: {.panel-tabset}
+
+### R
+
+```{r}
+#| label: r-flow
+#| eval: false
+flow <- game_flow(pbp, "y1_d122_IOL_VAS")
+plot_game_flow(flow, home_team = "VAS", away_team = "IOL")
+```
+
+### Python
+
+```{python}
+#| label: py-flow
+#| eval: false
+from smtstory.viz import win_probability_chart
+flow = c02.game_flow(enriched, "y1_d122_IOL_VAS")
+win_probability_chart(game, "VAS", "IOL", "wp_chart.png")
+```
+
+:::
+
+![Win probability across a 13-inning game](../outputs/engine_figures/wp_chart.png)

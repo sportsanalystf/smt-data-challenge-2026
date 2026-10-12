@@ -1,0 +1,62 @@
+[
+  {
+    "objectID": "index.html",
+    "href": "index.html",
+    "title": "On the Big Screen!",
+    "section": "",
+    "text": "1 On the Big Screen!\nThis project turns SMT player- and ball-tracking data into a real-time baseball storytelling engine: instead of showing raw statistics, it finds the interesting moments automatically, explains why they matter, and presents them in a form a fan understands in the seven seconds a scoreboard graphic is on screen.\nEverything is built twice — once in R, once in Python — so each component can be read in whichever language the reader prefers, and so the two act as a cross-check on each other.",
+    "crumbs": [
+      "<span class='chapter-number'>1</span>  <span class='chapter-title'>Overview</span>"
+    ]
+  },
+  {
+    "objectID": "index.html#how-the-project-is-organised",
+    "href": "index.html#how-the-project-is-organised",
+    "title": "On the Big Screen!",
+    "section": "1.1 How the project is organised",
+    "text": "1.1 How the project is organised\nEach component is a standalone module with a matching chapter in this book:\n\n\n\n\n\n\n\n\n\n#\nComponent\nR module\nPython module\n\n\n\n\n1\nPlay-by-play from tracking\nR/R01_play_by_play.R\ncomponents/c01_play_by_play.py\n\n\n2\nWPA & Leverage Index\nR/R02_wpa_leverage.R\ncomponents/c02_wpa_leverage.py\n\n\n3\nTracking features\nR/R03_tracking_features.R\ncomponents/c03_tracking_features.py\n\n\n4\nSpeed & baserunning\nR/R04_speed_baserunning.R\ncomponents/c04_speed_baserunning.py\n\n\n5\nPower & hitting\nR/R05_power_hitting.R\ncomponents/c05_power_hitting.py\n\n\n6\nPitching\nR/R06_pitching.R\ncomponents/c06_pitching.py\n\n\n7\nDefense & fielding\nR/R07_defense.R\ncomponents/c07_defense.py\n\n\n8\nFan-interactive games\nR/R08_fan_interactive.R\ncomponents/c08_fan_interactive.py\n\n\n9\nComposite & storytelling\nR/R09_composite.R\ncomponents/c09_composite.py\n\n\n10\nPlay animation\nR/R10_animation.R\ncomponents/c10_animation.py\n\n\n\nThe R modules extend the organizers’ own SMT_Data_Starter.R — its Arrow datasets, animate_play() and create_play_by_play() are used directly rather than reimplemented.",
+    "crumbs": [
+      "<span class='chapter-number'>1</span>  <span class='chapter-title'>Overview</span>"
+    ]
+  },
+  {
+    "objectID": "index.html#the-dependency-that-shapes-everything",
+    "href": "index.html#the-dependency-that-shapes-everything",
+    "title": "On the Big Screen!",
+    "section": "1.2 The dependency that shapes everything",
+    "text": "1.2 The dependency that shapes everything\nThe SMT tables record base occupancy but no outs, no count, and no score. Win probability, leverage and run expectancy are all functions of (inning, half, outs, base state, score differential), so none of them exist until game state is reconstructed. That is why Component 1 comes first: it is not bookkeeping, it is the foundation the entire engine stands on.\nComponent 1 validates against real baseball rates:\n\n\n\nQuantity\nReconstructed\nReal MiLB reference\n\n\n\n\nRuns per game\n10.12\n≈ 9.5\n\n\nHits per game\n19.7\n≈ 18\n\n\nPlate appearances per game\n76.6\n≈ 76\n\n\nHalf-innings balancing to 3 outs\n99.8 %\n100 %",
+    "crumbs": [
+      "<span class='chapter-number'>1</span>  <span class='chapter-title'>Overview</span>"
+    ]
+  },
+  {
+    "objectID": "index.html#headline-results",
+    "href": "index.html#headline-results",
+    "title": "On the Big Screen!",
+    "section": "1.3 Headline results",
+    "text": "1.3 Headline results\n\n\n\n\n\n\n\n\n\n#\nScoreboard product\nTechnique\nResult on the real data\n\n\n\n\n1\nThe Robbery Meter\nClassification\n7,058 chances; 95.5 % accuracy, AUC 0.954\n\n\n2\nCatch or No Catch?\nClassification + viz\nSuspense plays isolated near 50 % catch odds\n\n\n3\nBurner Board\nFeature eng. + viz\nTop runner 22.8 mph\n\n\n4\nStatcast Smash\nFeature eng.\n121.6 mph 90th-pct leader; max 122\n\n\n5\nMoonshot Meter\nFeature eng.\nLongest carry 466.9 ft\n\n\n6\nRadar Gun Live\nFeature eng. + viz\nTop pitch 103 mph\n\n\n7\nOutfield Cannons\nFeature eng.\nHardest throw 102 mph\n\n\n8\nBarrel Zone\nFeature eng. + classification\n13.3 % barrel-rate leader\n\n\n9\nGround Crew Range\nFeature eng. + viz\nTop CF averages an 83 ft route\n\n\n10\nFive-Tool Scoreboard\nComposite\nTop all-around score 97.5 / 100\n\n\n\nPlus the situational layer that ties them together: win probability (accuracy 0.774, Brier 0.144), leverage (mean 1.000 by construction, max 8.23), and pitch tunneling that explains strikeouts.",
+    "crumbs": [
+      "<span class='chapter-number'>1</span>  <span class='chapter-title'>Overview</span>"
+    ]
+  },
+  {
+    "objectID": "index.html#running-the-code",
+    "href": "index.html#running-the-code",
+    "title": "On the Big Screen!",
+    "section": "1.4 Running the code",
+    "text": "1.4 Running the code\nexport SMT_DATA_ROOT=/path/to/SMT-Data-Challenge-2026\n\n# Python: the full pipeline\npython pipeline/run_all.py\npython pipeline/build_animations.py\n\n# R: source the modules in order\nRscript -e 'source(\"R/smt_setup.R\"); source_smt_starter()'\n\n# Render this book\nquarto render quarto/",
+    "crumbs": [
+      "<span class='chapter-number'>1</span>  <span class='chapter-title'>Overview</span>"
+    ]
+  },
+  {
+    "objectID": "index.html#what-is-deliberately-not-modelled",
+    "href": "index.html#what-is-deliberately-not-modelled",
+    "title": "On the Big Screen!",
+    "section": "1.5 What is deliberately not modelled",
+    "text": "1.5 What is deliberately not modelled\nHonesty about scope was treated as a feature of the submission:\n\nCalled strike probability — the data contains no umpire calls, so there is nothing to supervise. A calibrated geometric zone flag and a genuinely supervised P(ball in play | location) are provided instead.\nStolen-base / pickoff probability — no steal or pickoff outcome labels exist. Those products report measured lead distance and burst.\nSpin rate — not recoverable from positional tracking. Pitch movement (deviation from a straight line, with gravity removed) is used instead.",
+    "crumbs": [
+      "<span class='chapter-number'>1</span>  <span class='chapter-title'>Overview</span>"
+    ]
+  }
+]

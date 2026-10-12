@@ -1,0 +1,100 @@
+---
+title: "Overview"
+---
+
+# On the Big Screen!
+
+This project turns SMT player- and ball-tracking data into a **real-time
+baseball storytelling engine**: instead of showing raw statistics, it finds the
+interesting moments automatically, explains why they matter, and presents them
+in a form a fan understands in the seven seconds a scoreboard graphic is on
+screen.
+
+Everything is built **twice — once in R, once in Python** — so each component
+can be read in whichever language the reader prefers, and so the two act as a
+cross-check on each other.
+
+## How the project is organised
+
+Each component is a standalone module with a matching chapter in this book:
+
+| # | Component | R module | Python module |
+|---|-----------|----------|---------------|
+| 1 | Play-by-play from tracking | `R/R01_play_by_play.R` | `components/c01_play_by_play.py` |
+| 2 | WPA & Leverage Index | `R/R02_wpa_leverage.R` | `components/c02_wpa_leverage.py` |
+| 3 | Tracking features | `R/R03_tracking_features.R` | `components/c03_tracking_features.py` |
+| 4 | Speed & baserunning | `R/R04_speed_baserunning.R` | `components/c04_speed_baserunning.py` |
+| 5 | Power & hitting | `R/R05_power_hitting.R` | `components/c05_power_hitting.py` |
+| 6 | Pitching | `R/R06_pitching.R` | `components/c06_pitching.py` |
+| 7 | Defense & fielding | `R/R07_defense.R` | `components/c07_defense.py` |
+| 8 | Fan-interactive games | `R/R08_fan_interactive.R` | `components/c08_fan_interactive.py` |
+| 9 | Composite & storytelling | `R/R09_composite.R` | `components/c09_composite.py` |
+| 10 | Play animation | `R/R10_animation.R` | `components/c10_animation.py` |
+
+The R modules extend the organizers' own `SMT_Data_Starter.R` — its Arrow
+datasets, `animate_play()` and `create_play_by_play()` are used directly rather
+than reimplemented.
+
+## The dependency that shapes everything
+
+The SMT tables record base occupancy but **no outs, no count, and no score**.
+Win probability, leverage and run expectancy are all functions of
+`(inning, half, outs, base state, score differential)`, so **none of them exist
+until game state is reconstructed**. That is why Component 1 comes first: it is
+not bookkeeping, it is the foundation the entire engine stands on.
+
+Component 1 validates against real baseball rates:
+
+| Quantity | Reconstructed | Real MiLB reference |
+|---|---|---|
+| Runs per game | 10.12 | ≈ 9.5 |
+| Hits per game | 19.7 | ≈ 18 |
+| Plate appearances per game | 76.6 | ≈ 76 |
+| Half-innings balancing to 3 outs | 99.8 % | 100 % |
+
+## Headline results
+
+| # | Scoreboard product | Technique | Result on the real data |
+|---|---|---|---|
+| 1 | The Robbery Meter | Classification | 7,058 chances; 95.5 % accuracy, AUC 0.954 |
+| 2 | Catch or No Catch? | Classification + viz | Suspense plays isolated near 50 % catch odds |
+| 3 | Burner Board | Feature eng. + viz | Top runner 22.8 mph |
+| 4 | Statcast Smash | Feature eng. | 121.6 mph 90th-pct leader; max 122 |
+| 5 | Moonshot Meter | Feature eng. | Longest carry 466.9 ft |
+| 6 | Radar Gun Live | Feature eng. + viz | Top pitch 103 mph |
+| 7 | Outfield Cannons | Feature eng. | Hardest throw 102 mph |
+| 8 | Barrel Zone | Feature eng. + classification | 13.3 % barrel-rate leader |
+| 9 | Ground Crew Range | Feature eng. + viz | Top CF averages an 83 ft route |
+| 10 | Five-Tool Scoreboard | Composite | Top all-around score 97.5 / 100 |
+
+Plus the situational layer that ties them together: win probability
+(accuracy 0.774, Brier 0.144), leverage (mean 1.000 by construction, max 8.23),
+and pitch tunneling that explains strikeouts.
+
+## Running the code
+
+```bash
+export SMT_DATA_ROOT=/path/to/SMT-Data-Challenge-2026
+
+# Python: the full pipeline
+python pipeline/run_all.py
+python pipeline/build_animations.py
+
+# R: source the modules in order
+Rscript -e 'source("R/smt_setup.R"); source_smt_starter()'
+
+# Render this book
+quarto render quarto/
+```
+
+## What is deliberately not modelled
+
+Honesty about scope was treated as a feature of the submission:
+
+- **Called strike probability** — the data contains no umpire calls, so there is
+  nothing to supervise. A calibrated geometric zone flag and a genuinely
+  supervised *P(ball in play | location)* are provided instead.
+- **Stolen-base / pickoff probability** — no steal or pickoff outcome labels
+  exist. Those products report *measured* lead distance and burst.
+- **Spin rate** — not recoverable from positional tracking. Pitch *movement*
+  (deviation from a straight line, with gravity removed) is used instead.

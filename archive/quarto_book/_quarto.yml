@@ -1,0 +1,47 @@
+project:
+  type: book
+  output-dir: ../outputs/quarto
+
+book:
+  title: "On the Big Screen!"
+  subtitle: "A Real-Time Baseball Storytelling Engine — SMT Data Challenge 2026"
+  author: "SMT Data Challenge Submission"
+  date: today
+  chapters:
+    - index.qmd
+    - 01-play-by-play.qmd
+    - 02-wpa-leverage.qmd
+    - 03-animation.qmd
+    - 04-speed-baserunning.qmd
+    - 05-power-hitting.qmd
+    - 06-pitching.qmd
+    - 07-defense.qmd
+    - 08-fan-interactive.qmd
+    - 09-composite-storytelling.qmd
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    code-tools: true
+    df-print: kable
+    fig-width: 8
+    fig-height: 5
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+
+execute:
+  warning: false
+  message: false
+  # Set to true to run the code when rendering. Left false so the document
+  # renders on a machine without the 4.5 GB tracking dataset mounted.
+  freeze: auto
+
+knitr:
+  opts_chunk:
+    collapse: true
+    comment: "#>"

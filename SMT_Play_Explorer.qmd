@@ -1,0 +1,1051 @@
+---
+title: "On the Big Screen! — Play Explorer"
+subtitle: "Win Probability Added, Leverage Index, and a click-to-watch replay of every play"
+author: "SMT Data Challenge 2026"
+date: today
+format:
+  html:
+    theme: darkly
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show the code"
+    embed-resources: true
+    fig-width: 9
+    fig-height: 4.5
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(arrow)
+library(jsonlite)
+
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+
+# ---------------------------------------------------------------- parameters
+# Point this at the folder holding ball-events/, ball-positions/, etc.
+# It is auto-detected when this file sits inside the challenge folder.
+find_data_root <- function() {
+  env <- Sys.getenv("SMT_DATA_ROOT", unset = "")
+  if (env != "") return(normalizePath(env, mustWork = FALSE))
+  for (cand in c(".", "..", "../..")) {
+    if (dir.exists(file.path(cand, "ball-events"))) {
+      return(normalizePath(cand, mustWork = FALSE))
+    }
+  }
+  stop("Could not find the data. Set SMT_DATA_ROOT.")
+}
+
+DATA_ROOT <- find_data_root()
+SHOWCASE  <- "y1_d122_IOL_VAS"   # the game the explorer replays
+N_GAMES   <- 250                 # games used to FIT the models
+```
+
+```{r}
+#| label: constants
+#| include: false
+
+FT_S_TO_MPH        <- 0.681818
+OUTS_PER_HALF      <- 3L
+RUBBER_TO_PLATE_FT <- 60.5
+COMMIT_POINT_FT    <- 23.8       # where a hitter must commit (~175 ms out)
+GRAVITY_FT_S2      <- 32.174
+AVG_SPEED_FACTOR   <- 0.93       # a pitch loses ~8% of its speed en route
+
+BASE_STATES <- c("___", "1__", "_2_", "12_", "__3", "1_3", "_23", "123")
+POS_ABBR <- c("1"="P","2"="C","3"="1B","4"="2B","5"="3B","6"="SS",
+              "7"="LF","8"="CF","9"="RF","10"="BAT","11"="R1","12"="R2","13"="R3")
+
+EVENT <- c(PITCH=1, ACQUIRED=2, THROW=3, HIT_INTO_PLAY=4, END_OF_PLAY=5,
+           PICKOFF=6, ACQUIRED_UNK=7, THROW_UNK=8, DEFLECTION=9,
+           DEFLECTION_WALL=10, HOME_RUN=11, BOUNCE=16)
+
+# Codes meaning the ball stayed live after contact. A foul shares code 4 with a
+# live batted ball, so this set is how the two are told apart.
+LIVE_BALL_CODES <- unname(EVENT[c("ACQUIRED","THROW","ACQUIRED_UNK","THROW_UNK",
+                                  "DEFLECTION","DEFLECTION_WALL","BOUNCE")])
+
+THEME <- list(ink="#12181f", panel="#161f2b", panel2="#22303f", text="#ffffff",
+              muted="#9fb0c0", grass="#0b6b3a", gold="#ffc72c",
+              accent="#c8102e", home="#2f80ed", away="#f2994a")
+
+theme_scoreboard <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.background  = element_rect(fill = THEME$ink, colour = NA),
+      panel.background = element_rect(fill = THEME$panel, colour = NA),
+      panel.grid.major = element_line(colour = THEME$panel2),
+      panel.grid.minor = element_blank(),
+      text = element_text(colour = THEME$text),
+      axis.text = element_text(colour = THEME$muted),
+      plot.title = element_text(face = "bold", size = base_size + 4),
+      plot.subtitle = element_text(colour = THEME$muted),
+      legend.position = "bottom")
+}
+```
+
+```{r}
+#| label: open-data
+#| include: false
+
+# Arrow datasets, opened exactly as the organizers' starter does -- but with the
+# path resolved for this machine rather than hard-coded.
+na_vals <- c("", "NA", "NULL", NA, "\\N")
+
+ball_positions <- open_csv_dataset(
+  file.path(DATA_ROOT, "ball-positions"),
+  partitioning = c("home_team","away_team","year","day"),
+  col_names = c("game_string","play_per_game","timestamp",
+                "ball_position_x","ball_position_y","ball_position_z"),
+  hive_style = FALSE, unify_schemas = TRUE, na = na_vals)
+
+ball_events <- open_csv_dataset(
+  file.path(DATA_ROOT, "ball-events"),
+  partitioning = c("home_team","away_team","year","day"),
+  hive_style = FALSE, unify_schemas = TRUE, na = na_vals)
+
+player_positions <- open_csv_dataset(
+  file.path(DATA_ROOT, "player-positions"),
+  partitioning = c("home_team","away_team","year","day"),
+  col_names = c("game_string","play_per_game","timestamp",
+                "player_id","field_x","field_y"),
+  hive_style = FALSE, unify_schemas = TRUE, na = na_vals)
+
+lineups <- open_csv_dataset(file.path(DATA_ROOT, "lineups.csv"),
+                            hive_style = FALSE, unify_schemas = TRUE,
+                            na = na_vals) %>% collect()
+game_info <- open_csv_dataset(file.path(DATA_ROOT, "game-info.csv"),
+                              hive_style = FALSE, unify_schemas = TRUE,
+                              na = na_vals) %>% collect()
+```
+
+# What this document does
+
+The SMT tables record **base occupancy** but not outs, runs or the score. Win
+Probability Added and Leverage Index are functions of
+
+$$(\text{inning},\ \text{half},\ \text{outs},\ \text{base state},\ \text{score differential})$$
+
+so neither can be computed until that game state is reconstructed. This document
+does the whole chain in R, in one file:
+
+1. **Reconstruct play-by-play** from base-occupancy transitions and the event stream
+2. **Fit Run Expectancy and Win Probability**, then compute **WPA and Leverage in parallel**
+3. **Build a clickable explorer** — pick any play and watch it, with the numbers that explain it
+
+---
+
+# 1. Reconstructing play-by-play
+
+For each half-inning we walk the at-bats and apply an accounting identity.
+Everyone on base before the play, plus the batter, must end up in exactly one of
+three places — still on base, across the plate, or retired:
+
+$$|B| + 1 = |A| + \text{runs} + \text{outs}$$
+
+$|B|$ and $|A|$ are read from `lineups`; whether the batter reached comes from the
+*next* at-bat's occupancy. The half-inning must total three outs, which closes
+the system.
+
+Three details matter, each found by checking output against real baseball rates:
+
+- **Count the batter once.** Subtracting him from both sides produced a 31–28 final score.
+- **Skip the identity on the last at-bat of a half-inning.** With no observed "after" state, runners left on base look identical to runs.
+- **Only the terminal play decides the outcome.** A foul shares event code 4 with a live batted ball, so a walk after a foul was being recorded as a single.
+
+```{r}
+#| label: reconstruction-helpers
+
+base_state_code <- function(on1, on2, on3) {
+  as.integer(!is.na(on1)) + 2L * as.integer(!is.na(on2)) + 4L * as.integer(!is.na(on3))
+}
+
+describe_state <- function(base_state, outs) {
+  on1 <- bitwAnd(base_state, 1L) > 0
+  on2 <- bitwAnd(base_state, 2L) > 0
+  on3 <- bitwAnd(base_state, 4L) > 0
+  bases <- case_when(
+    !on1 & !on2 & !on3 ~ "bases empty",
+    on1 & on2 & on3    ~ "bases loaded",
+    on1 & on3          ~ "runners on the corners",
+    on1 & on2          ~ "runners on first and second",
+    on2 & on3          ~ "runners on second and third",
+    on1                ~ "a runner on first",
+    on2                ~ "a runner on second",
+    TRUE               ~ "a runner on third")
+  outs_txt <- case_when(outs == 0 ~ "nobody out", outs == 1 ~ "one out",
+                        TRUE ~ "two outs")
+  paste0(bases, ", ", outs_txt)
+}
+
+# TRUE if the terminal play was a batted ball that stayed live (not a foul).
+is_live_contact <- function(term_codes) {
+  if (length(term_codes) == 0) return(FALSE)
+  if (EVENT[["HOME_RUN"]] %in% term_codes) return(TRUE)
+  if (!(EVENT[["HIT_INTO_PLAY"]] %in% term_codes)) return(FALSE)
+  hit_idx <- which(term_codes == EVENT[["HIT_INTO_PLAY"]])[1]
+  any(term_codes[-seq_len(hit_idx)] %in% LIVE_BALL_CODES)
+}
+
+# Baseball physics bounds how many runners can score, which stops
+# pinch-runner substitutions from being mistaken for runs.
+max_plausible_runs <- function(kind, on1, on2, on3) {
+  n1 <- as.integer(!is.na(on1)); n2 <- as.integer(!is.na(on2))
+  n3 <- as.integer(!is.na(on3)); on_base <- n1 + n2 + n3
+  switch(kind,
+         "home_run" = on_base + 1L, "triple" = on_base,
+         "double"   = n1 + n2 + n3, "single" = n2 + n3,
+         "walk_hbp" = if (n1 && n2 && n3) 1L else 0L,
+         "out"      = n3, "fielders_choice" = n3, on_base)
+}
+```
+
+```{r}
+#| label: reconstruct-fn
+
+reconstruct_game <- function(game_string) {
+
+  lu <- lineups %>% filter(game_string == !!game_string)
+  if (nrow(lu) == 0) return(NULL)
+
+  ev <- ball_events %>%
+    filter(game_string == !!game_string) %>%
+    collect() %>%
+    mutate(across(c(play_per_game, timestamp, player_id, ball_eventcode),
+                  as.numeric))
+
+  pa <- lu %>% filter(!coalesce(is_pickoff, FALSE))
+
+  ab <- pa %>%
+    group_by(inning, half_inning, at_bat) %>%
+    summarise(first_play = min(play_per_game), last_play = max(play_per_game),
+              n_pitches = n(), batter = first(batter), pitcher = first(pitcher),
+              on_1b = first(on_1b), on_2b = first(on_2b), on_3b = first(on_3b),
+              home_team = first(home_team), away_team = first(away_team),
+              .groups = "drop") %>%
+    mutate(half_order = as.integer(half_inning == "Bottom")) %>%
+    arrange(inning, half_order, at_bat)
+
+  plays_by_ab <- pa %>%
+    group_by(inning, half_inning, at_bat) %>%
+    summarise(plays = list(play_per_game), .groups = "drop")
+
+  out_rows <- list()
+
+  for (key in unique(paste(ab$inning, ab$half_order))) {
+    grp <- ab %>% filter(paste(inning, half_order) == key) %>% arrange(at_bat)
+    n <- nrow(grp); if (n == 0) next
+    recs <- vector("list", n)
+
+    ## pass 1 -- batter outcome and departures
+    for (i in seq_len(n)) {
+      r   <- grp[i, ]
+      nxt <- if (i < n) grp[i + 1, ] else NULL
+
+      before <- c(r$on_1b, r$on_2b, r$on_3b); before <- before[!is.na(before)]
+      after  <- if (!is.null(nxt)) {
+        a <- c(nxt$on_1b, nxt$on_2b, nxt$on_3b); a[!is.na(a)]
+      } else character(0)
+
+      dest <- NA_integer_
+      if (!is.null(nxt)) {
+        dest <- 0L
+        if (!is.na(nxt$on_1b) && nxt$on_1b == r$batter) dest <- 1L
+        else if (!is.na(nxt$on_2b) && nxt$on_2b == r$batter) dest <- 2L
+        else if (!is.na(nxt$on_3b) && nxt$on_3b == r$batter) dest <- 3L
+      }
+
+      plays <- plays_by_ab %>%
+        filter(inning == r$inning, half_inning == r$half_inning,
+               at_bat == r$at_bat) %>% pull(plays) %>% unlist()
+
+      term_codes <- ev %>%
+        filter(play_per_game == max(plays)) %>%
+        arrange(timestamp) %>% pull(ball_eventcode)
+      live <- is_live_contact(term_codes)
+
+      kind <- if (EVENT[["HOME_RUN"]] %in% term_codes) {
+        "home_run"
+      } else if (!is.na(dest) && dest > 0) {
+        if (!live) "walk_hbp" else switch(as.character(dest), "1"="single",
+                                          "2"="double", "3"="triple", "single")
+      } else "out"
+      if (kind == "home_run") dest <- 4L
+
+      is_last     <- is.null(nxt)
+      gone        <- if (is_last) 0L else max(0L, length(before) + 1L - length(after))
+      batter_out  <- if (is.na(dest) || dest == 0) 1L else 0L
+      runner_gone <- max(0L, gone - batter_out)
+
+      recs[[i]] <- list(
+        inning = as.integer(r$inning), half_inning = as.character(r$half_inning),
+        at_bat = as.integer(r$at_bat), first_play = as.numeric(r$first_play),
+        last_play = as.numeric(r$last_play), n_pitches = as.integer(r$n_pitches),
+        batter = as.character(r$batter), pitcher = as.character(r$pitcher),
+        home_team = as.character(r$home_team), away_team = as.character(r$away_team),
+        on_1b = as.character(r$on_1b), on_2b = as.character(r$on_2b),
+        on_3b = as.character(r$on_3b),
+        outcome = kind, ball_in_play = live, n_before = length(before),
+        batter_out = batter_out, runner_gone = runner_gone, is_last = is_last)
+    }
+
+    ## pass 2 -- split departures between runs and outs
+    batter_outs <- vapply(recs, function(x) x$batter_out, integer(1))
+    avail  <- sum(vapply(recs, function(x) x$runner_gone, integer(1)))
+    needed <- min(max(0L, OUTS_PER_HALF - sum(batter_outs)), avail)
+
+    ord <- order(batter_outs == 0,
+                 !vapply(recs, function(x) x$ball_in_play, logical(1)))
+    runner_outs <- integer(n); remaining <- needed
+    for (i in ord) {
+      if (remaining <= 0) break
+      if (recs[[i]]$outcome == "home_run") next
+      take <- min(recs[[i]]$runner_gone, remaining)
+      runner_outs[i] <- take; remaining <- remaining - take
+    }
+
+    for (i in seq_len(n)) {
+      rec <- recs[[i]]
+      if (rec$outcome == "home_run") {
+        recs[[i]]$runs <- rec$n_before + 1L; recs[[i]]$outs_on_play <- 0L
+      } else if (rec$is_last) {
+        used <- sum(vapply(recs[seq_len(i - 1)],
+                           function(x) x$outs_on_play, integer(1)))
+        recs[[i]]$outs_on_play <- max(0L, OUTS_PER_HALF - used)
+        recs[[i]]$runs <- 0L
+      } else {
+        recs[[i]]$outs_on_play <- batter_outs[i] + runner_outs[i]
+        cap <- max_plausible_runs(rec$outcome, rec$on_1b, rec$on_2b, rec$on_3b)
+        recs[[i]]$runs <- as.integer(min(max(0L, rec$runner_gone - runner_outs[i]),
+                                         cap))
+      }
+    }
+
+    ## pass 3 -- running outs, clamped so the state can never be illegal
+    outs_before <- 0L
+    for (i in seq_len(n)) {
+      allowance <- OUTS_PER_HALF - outs_before
+      recs[[i]]$outs_on_play <- max(0L, min(recs[[i]]$outs_on_play, allowance))
+      recs[[i]]$outs_before  <- min(outs_before, OUTS_PER_HALF - 1L)
+      outs_before <- min(OUTS_PER_HALF, outs_before + recs[[i]]$outs_on_play)
+      recs[[i]]$base_state_before <- base_state_code(recs[[i]]$on_1b,
+                                                     recs[[i]]$on_2b,
+                                                     recs[[i]]$on_3b)
+    }
+    out_rows <- c(out_rows, recs)
+  }
+
+  df <- bind_rows(lapply(out_rows, function(x) {
+    x$is_last <- NULL; x$batter_out <- NULL; x$runner_gone <- NULL
+    as_tibble(x)
+  }))
+
+  df <- df %>%
+    arrange(inning, as.integer(half_inning == "Bottom"), at_bat) %>%
+    mutate(
+      game_string = !!game_string,
+      batting_team = ifelse(half_inning == "Top", away_team, home_team),
+      home_score_after = cumsum(ifelse(half_inning == "Bottom", runs, 0L)),
+      away_score_after = cumsum(ifelse(half_inning == "Top", runs, 0L)),
+      home_score_before = home_score_after - ifelse(half_inning == "Bottom", runs, 0L),
+      away_score_before = away_score_after - ifelse(half_inning == "Top", runs, 0L),
+      score_diff_before = ifelse(half_inning == "Top",
+                                 away_score_before - home_score_before,
+                                 home_score_before - away_score_before),
+      situation = paste0(ifelse(half_inning == "Top", "Top ", "Bot "), inning,
+                         ", ", describe_state(base_state_before, outs_before)))
+
+  hf <- max(df$home_score_after); af <- max(df$away_score_after)
+  # The win-probability target must be complementary: writing this as two strict
+  # inequalities marks BOTH sides as losers in a tied game, and the model then
+  # learns from contradictory rows. Ties go to the away side.
+  df %>% mutate(
+    home_final = hf, away_final = af,
+    batting_team_won = ifelse(half_inning == "Bottom",
+                              as.integer(hf > af), as.integer(af >= hf)))
+}
+```
+
+```{r}
+#| label: run-reconstruction
+
+all_games <- unique(game_info$game_string)
+fit_games <- unique(c(SHOWCASE, head(all_games, N_GAMES)))
+
+# Reconstruction is embarrassingly parallel across games -- each one is
+# independent -- so it is spread over the available cores. mclapply falls back
+# to a single core on Windows, which is why the worker count is guarded.
+n_cores <- max(1L, parallel::detectCores() - 1L)
+if (.Platform$OS.type != "unix") n_cores <- 1L
+
+pbp_list <- parallel::mclapply(fit_games, function(g) {
+  tryCatch(reconstruct_game(g), error = function(e) NULL)
+}, mc.cores = n_cores)
+
+pbp <- bind_rows(pbp_list)
+pbp_showcase <- pbp %>% filter(game_string == SHOWCASE)
+```
+
+```{r}
+#| label: validation
+#| echo: false
+
+n_games <- n_distinct(pbp$game_string)
+tibble(
+  metric = c("games reconstructed", "plate appearances", "runs per game",
+             "hits per game", "walks per game", "plate appearances per game"),
+  value = c(n_games, nrow(pbp),
+            round(sum(pbp$runs) / n_games, 2),
+            round(sum(pbp$outcome %in% c("single","double","triple","home_run")) / n_games, 2),
+            round(sum(pbp$outcome == "walk_hbp") / n_games, 2),
+            round(nrow(pbp) / n_games, 2)),
+  real_baseball = c(NA, NA, 9.5, 18.0, 7.0, 76.0)
+) %>% knitr::kable(caption = "Reconstruction checked against real MiLB rates")
+```
+
+---
+
+# 2. WPA and Leverage, computed in parallel
+
+Both metrics are built from the same win-probability model, so they are computed
+together in one pass and presented side by side.
+
+```{r}
+#| label: run-expectancy
+
+# Run expectancy: average runs from a base/out state to the end of the inning.
+re_tbl <- pbp %>%
+  arrange(game_string, inning, half_inning, at_bat) %>%
+  group_by(game_string, inning, half_inning) %>%
+  mutate(runs_rest = rev(cumsum(rev(runs)))) %>%
+  ungroup() %>%
+  filter(outs_before < OUTS_PER_HALF) %>%
+  group_by(base_state_before, outs_before) %>%
+  summarise(run_expectancy = mean(runs_rest), n = n(), .groups = "drop")
+
+re_vector <- function(base_state, outs) {
+  ref <- setNames(re_tbl$run_expectancy,
+                  paste(re_tbl$base_state_before, re_tbl$outs_before))
+  out <- unname(ref[paste(base_state, outs)])
+  out[is.na(out) | outs >= OUTS_PER_HALF] <- 0
+  out
+}
+
+re_tbl %>%
+  mutate(bases = BASE_STATES[base_state_before + 1],
+         outs = paste0(outs_before, ifelse(outs_before == 1, " out", " outs"))) %>%
+  select(bases, outs, run_expectancy) %>%
+  pivot_wider(names_from = outs, values_from = run_expectancy) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  knitr::kable(caption = "Run expectancy — falls across outs for every base state")
+```
+
+```{r}
+#| label: win-probability
+
+wp_features <- function(d) {
+  d %>% mutate(
+    innings_left = pmax(0, 9 - inning + ifelse(half_inning == "Top", 0.5, 0)),
+    is_bottom = as.integer(half_inning == "Bottom"),
+    runners_on = as.integer(bitwAnd(base_state_before, 1L) > 0) +
+      as.integer(bitwAnd(base_state_before, 2L) > 0) +
+      as.integer(bitwAnd(base_state_before, 4L) > 0),
+    in_scoring_position = as.integer(bitwAnd(base_state_before, 6L) > 0),
+    re_state = re_vector(base_state_before, outs_before),
+    score_diff = score_diff_before,
+    score_diff_x_innings_left = score_diff_before * innings_left,
+    score_diff_per_inning_left = score_diff_before / (innings_left + 1),
+    outs = outs_before)
+}
+
+# A logistic model rather than an empirical lookup: 250 games cannot fill an
+# (inning x base-out x score-margin) grid, and a lookup gives jagged,
+# non-monotonic probabilities that look broken on a scoreboard.
+wp_model <- glm(
+  batting_team_won ~ score_diff + innings_left + score_diff_x_innings_left +
+    score_diff_per_inning_left + outs + re_state + is_bottom + runners_on +
+    in_scoring_position,
+  family = binomial(), data = wp_features(pbp))
+
+predict_wp <- function(d) as.numeric(predict(wp_model, newdata = wp_features(d),
+                                             type = "response"))
+```
+
+```{r}
+#| label: wpa-and-leverage
+
+## ---- WPA -----------------------------------------------------------------
+# The half-inning flip matters: after the third out the other team bats, so the
+# batting team's win probability becomes the COMPLEMENT of the next state's.
+pbp <- pbp %>% arrange(game_string, inning,
+                       as.integer(half_inning == "Bottom"), at_bat)
+pbp$wp_before <- predict_wp(pbp)
+
+pbp <- pbp %>%
+  group_by(game_string) %>%
+  mutate(
+    .nxt = lead(wp_before),
+    .same = lead(half_inning) == half_inning & lead(inning) == inning,
+    wp_after = case_when(is.na(.nxt) ~ as.numeric(batting_team_won),
+                         .same       ~ .nxt,
+                         TRUE        ~ 1 - .nxt),
+    wpa = wp_after - wp_before) %>%
+  select(-.nxt, -.same) %>%
+  ungroup()
+
+## ---- Leverage ------------------------------------------------------------
+# Vectorized state transition: apply an outcome to every state at once.
+apply_outcome_vec <- function(base_state, outs, kind) {
+  n <- length(base_state)
+  on1 <- bitwAnd(base_state, 1L) > 0
+  on2 <- bitwAnd(base_state, 2L) > 0
+  on3 <- bitwAnd(base_state, 4L) > 0
+  bits <- function(a, b, c) as.integer(a) + 2L*as.integer(b) + 4L*as.integer(c)
+
+  if (kind %in% c("out", "fielders_choice"))
+    return(list(base = base_state, outs = outs + 1L, runs = rep(0L, n)))
+  if (kind == "walk_hbp")
+    return(list(base = case_when(!on1 ~ bits(TRUE, on2, on3),
+                                 !on2 ~ bits(TRUE, TRUE, on3),
+                                 TRUE ~ 7L),
+                outs = outs, runs = as.integer(on1 & on2 & on3)))
+  if (kind == "single")
+    return(list(base = bits(TRUE, on1, rep(FALSE, n)), outs = outs,
+                runs = as.integer(on2) + as.integer(on3)))
+  if (kind == "double")
+    return(list(base = rep(2L, n), outs = outs,
+                runs = as.integer(on1) + as.integer(on2) + as.integer(on3)))
+  if (kind == "triple")
+    return(list(base = rep(4L, n), outs = outs,
+                runs = as.integer(on1) + as.integer(on2) + as.integer(on3)))
+  if (kind == "home_run")
+    return(list(base = rep(0L, n), outs = outs,
+                runs = 1L + as.integer(on1) + as.integer(on2) + as.integer(on3)))
+  list(base = base_state, outs = outs, runs = rep(0L, n))
+}
+
+# Leverage = expected |change in win probability| from a state, normalized so an
+# average plate appearance is 1.0. Done with ONE prediction per outcome across
+# the whole season rather than one per plate appearance -- six model calls
+# instead of tens of thousands.
+mix <- pbp %>% count(outcome) %>% mutate(p = n / sum(n))
+outcome_mix <- setNames(mix$p, mix$outcome)
+
+wp0 <- predict_wp(pbp)
+swing_total <- rep(0, nrow(pbp))
+
+for (kind in names(outcome_mix)) {
+  st <- apply_outcome_vec(pbp$base_state_before, pbp$outs_before, kind)
+  ended <- st$outs >= OUTS_PER_HALF
+  nxt <- tibble(
+    inning = ifelse(ended & pbp$half_inning == "Bottom", pbp$inning + 1L, pbp$inning),
+    half_inning = ifelse(ended, ifelse(pbp$half_inning == "Top", "Bottom", "Top"),
+                         pbp$half_inning),
+    outs_before = ifelse(ended, 0L, st$outs),
+    base_state_before = ifelse(ended, 0L, st$base),
+    score_diff_before = ifelse(ended, -(pbp$score_diff_before + st$runs),
+                               pbp$score_diff_before + st$runs))
+  wp1 <- predict_wp(nxt)
+  wp1 <- ifelse(ended, 1 - wp1, wp1)
+  swing_total <- swing_total + outcome_mix[[kind]] * abs(wp1 - wp0)
+}
+
+pbp <- pbp %>%
+  mutate(leverage_index = swing_total / mean(swing_total, na.rm = TRUE),
+         clutch_score = 100 * tanh(3 * abs(wpa) * sqrt(pmax(leverage_index, 0))))
+
+pbp_showcase <- pbp %>% filter(game_string == SHOWCASE)
+```
+
+```{r}
+#| label: model-quality
+#| echo: false
+
+p <- predict_wp(pbp); y <- pbp$batting_team_won
+li <- pbp$leverage_index[is.finite(pbp$leverage_index)]
+
+bind_rows(
+  tibble(metric = "win probability — accuracy", value = round(mean((p >= .5) == (y == 1)), 3)),
+  tibble(metric = "win probability — Brier score", value = round(mean((p - y)^2), 3)),
+  tibble(metric = "win probability — base rate", value = round(mean(y), 3)),
+  tibble(metric = "leverage — mean (1.0 by construction)", value = round(mean(li), 3)),
+  tibble(metric = "leverage — 95th percentile", value = round(quantile(li, .95), 2)),
+  tibble(metric = "leverage — maximum", value = round(max(li), 2)),
+  tibble(metric = "share of plate appearances above 2.0 leverage",
+         value = round(mean(li >= 2), 3))
+) %>% knitr::kable(caption = "Model quality")
+```
+
+## The two metrics, side by side
+
+WPA says *how much a play changed the game*. Leverage says *how much was at
+stake before it happened*. Reading them together is what separates a
+meaningless three-run homer in a blowout from a game-winning single.
+
+::: {layout-ncol=2}
+
+```{r}
+#| label: fig-wpa
+#| fig-cap: "Win probability through the showcase game"
+#| echo: false
+
+flow <- pbp_showcase %>%
+  mutate(wp_home = ifelse(half_inning == "Bottom", wp_after, 1 - wp_after),
+         play_index = row_number())
+
+ggplot(flow, aes(play_index, wp_home)) +
+  geom_hline(yintercept = .5, linetype = "dashed", colour = THEME$muted) +
+  geom_ribbon(aes(ymin = .5, ymax = pmax(wp_home, .5)), fill = THEME$home, alpha = .35) +
+  geom_ribbon(aes(ymin = pmin(wp_home, .5), ymax = .5), fill = THEME$away, alpha = .35) +
+  geom_line(colour = THEME$text, linewidth = 1.1) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(title = "WIN PROBABILITY", x = "Plate appearance", y = NULL) +
+  theme_scoreboard()
+```
+
+```{r}
+#| label: fig-leverage
+#| fig-cap: "Leverage through the same game"
+#| echo: false
+
+flow_li <- pbp_showcase %>% mutate(play_index = row_number())
+
+ggplot(flow_li, aes(play_index, leverage_index)) +
+  geom_col(aes(fill = leverage_index >= 2), show.legend = FALSE) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = THEME$muted) +
+  scale_fill_manual(values = c(`TRUE` = THEME$accent, `FALSE` = THEME$panel2)) +
+  labs(title = "LEVERAGE INDEX", x = "Plate appearance", y = NULL) +
+  theme_scoreboard()
+```
+
+:::
+
+```{r}
+#| label: biggest-swings
+#| echo: false
+
+pbp %>%
+  arrange(desc(abs(wpa))) %>%
+  transmute(game = game_string, inning, half = half_inning, batter, outcome,
+            runs, wp_before = round(wp_before, 3), wp_after = round(wp_after, 3),
+            WPA = round(wpa, 3), leverage = round(leverage_index, 2)) %>%
+  head(8) %>%
+  knitr::kable(caption = "The biggest swings of the season — walk-offs and game-enders")
+```
+
+---
+
+# 3. The Play Explorer
+
+Every plate appearance of the showcase game, clickable. Selecting one replays it
+from the 20 Hz tracking and shows the numbers behind it.
+
+```{r}
+#| label: build-play-payload
+#| include: false
+
+meta_row <- game_info %>% filter(game_string == SHOWCASE) %>% slice(1)
+HOME_TEAM <- meta_row$home_team; AWAY_TEAM <- meta_row$away_team
+
+# --- tracking for every play of the showcase game -------------------------
+ball_track <- ball_positions %>%
+  filter(game_string == SHOWCASE) %>%
+  collect() %>%
+  mutate(across(c(play_per_game, timestamp, ball_position_x,
+                  ball_position_y, ball_position_z), as.numeric))
+
+player_track <- player_positions %>%
+  filter(game_string == SHOWCASE) %>%
+  collect() %>%
+  mutate(across(c(play_per_game, timestamp, player_id, field_x, field_y),
+                as.numeric)) %>%
+  filter(player_id <= 13)
+
+events_show <- ball_events %>%
+  filter(game_string == SHOWCASE) %>%
+  collect() %>%
+  mutate(across(c(play_per_game, timestamp, player_id, ball_eventcode),
+                as.numeric))
+
+# Frames are trimmed to the live ball and rounded to a tenth of a foot --
+# finer precision is invisible at scoreboard scale and triples the file size.
+build_track <- function(play) {
+  b <- ball_track %>% filter(play_per_game == play) %>% arrange(timestamp)
+  if (nrow(b) < 2) return(NULL)
+  e <- events_show %>% filter(play_per_game == play)
+
+  t0 <- if (any(e$ball_eventcode == EVENT[["PITCH"]])) {
+    min(e$timestamp[e$ball_eventcode == EVENT[["PITCH"]]])
+  } else min(b$timestamp)
+  t1 <- if (any(e$ball_eventcode == EVENT[["END_OF_PLAY"]])) {
+    max(e$timestamp[e$ball_eventcode == EVENT[["END_OF_PLAY"]]]) + 800
+  } else max(b$timestamp)
+
+  b <- b %>% filter(timestamp >= t0 - 400, timestamp <= t1)
+  if (nrow(b) < 2) return(NULL)
+  times <- b$timestamp
+
+  pl <- player_track %>% filter(play_per_game == play)
+  players <- list()
+  for (pid in sort(unique(pl$player_id))) {
+    trk <- pl %>% filter(player_id == pid) %>% arrange(timestamp)
+    if (nrow(trk) < 2) next
+    players[[as.character(pid)]] <- list(
+      x = round(approx(trk$timestamp, trk$field_x, xout = times, rule = 2)$y, 1),
+      y = round(approx(trk$timestamp, trk$field_y, xout = times, rule = 2)$y, 1))
+  }
+
+  marks <- e %>%
+    filter(ball_eventcode %in% c(1, 2, 3, 4, 5, 10, 11, 16)) %>%
+    transmute(t = round(timestamp - times[1]), code = ball_eventcode)
+
+  list(t = round(times - times[1]),
+       bx = round(b$ball_position_x, 1), by = round(b$ball_position_y, 1),
+       bz = round(b$ball_position_z, 1),
+       players = players,
+       events = if (nrow(marks)) marks else NULL)
+}
+
+play_ids <- sort(unique(pbp_showcase$last_play))
+tracks <- list()
+for (p in play_ids) {
+  tr <- build_track(p)
+  if (!is.null(tr)) tracks[[as.character(p)]] <- tr
+}
+
+# --- per-play metrics -----------------------------------------------------
+speed_of <- function(x, y, ts) {
+  dt <- diff(ts) / 1000; d <- sqrt(diff(x)^2 + diff(y)^2)
+  s <- ifelse(dt > 0, d / dt, NA_real_); s[is.finite(s)]
+}
+
+play_detail <- function(row) {
+  play <- row$last_play
+  e <- events_show %>% filter(play_per_game == play)
+  hit_t <- e$timestamp[e$ball_eventcode == EVENT[["HIT_INTO_PLAY"]]]
+  b <- ball_track %>% filter(play_per_game == play) %>% arrange(timestamp)
+
+  det <- list()
+
+  # Pitch velocity for the deciding pitch
+  pt <- e$timestamp[e$ball_eventcode == EVENT[["PITCH"]]]
+  if (length(pt) && nrow(b) >= 3) {
+    w <- b %>% filter(timestamp >= min(pt), timestamp <= min(pt) + 800)
+    if (nrow(w) >= 3) {
+      sp <- sqrt(diff(w$ball_position_x)^2 + diff(w$ball_position_y)^2 +
+                   diff(w$ball_position_z)^2) / (diff(w$timestamp) / 1000)
+      sp <- sp[is.finite(sp)]
+      if (length(sp)) {
+        v <- unname(quantile(sp, .9)) * FT_S_TO_MPH
+        if (v > 40 && v <= 103) det$pitch_velo <- round(v, 1)
+      }
+    }
+  }
+
+  if (length(hit_t)) {
+    th <- min(hit_t)
+    w <- b %>% filter(timestamp >= th, timestamp <= th + 400)
+    if (nrow(w) >= 3) {
+      sp <- sqrt(diff(w$ball_position_x)^2 + diff(w$ball_position_y)^2 +
+                   diff(w$ball_position_z)^2) / (diff(w$timestamp) / 1000)
+      sp <- sp[is.finite(sp)]
+      if (length(sp)) {
+        ev_mph <- unname(quantile(sp, .95)) * FT_S_TO_MPH
+        if (ev_mph > 20 && ev_mph < 125) det$exit_velo <- round(ev_mph, 1)
+      }
+      n <- min(4, nrow(w) - 1)
+      horiz <- sqrt((w$ball_position_x[n+1] - w$ball_position_x[1])^2 +
+                      (w$ball_position_y[n+1] - w$ball_position_y[1])^2)
+      if (horiz > 0) det$launch <- round(
+        atan2(w$ball_position_z[n+1] - w$ball_position_z[1], horiz) * 180/pi, 1)
+    }
+    # Carry: distance at the ball's first bounce, not its furthest point --
+    # relay throws carry the ball further from home AFTER it lands.
+    bp <- b %>% filter(timestamp >= th)
+    bounce <- e$timestamp[e$ball_eventcode == EVENT[["BOUNCE"]] & e$timestamp > th]
+    if (nrow(bp) >= 3) {
+      idx <- if (length(bounce)) which.min(abs(bp$timestamp - min(bounce))) else {
+        apex <- which.max(bp$ball_position_z)
+        apex + which.min(abs(bp$ball_position_z[apex:nrow(bp)] -
+                               bp$ball_position_z[1])) - 1
+      }
+      idx <- min(max(idx, 1), nrow(bp))
+      det$carry <- round(sqrt(bp$ball_position_x[idx]^2 + bp$ball_position_y[idx]^2), 1)
+    }
+
+    # Fielder who handled it, and the ground covered
+    acq <- e %>% filter(ball_eventcode %in% c(EVENT[["ACQUIRED"]], EVENT[["ACQUIRED_UNK"]]),
+                        timestamp >= th, player_id >= 1, player_id <= 9) %>%
+      arrange(timestamp)
+    if (nrow(acq) && (acq$timestamp[1] - th) / 1000 < 12) {
+      fid <- acq$player_id[1]; ta <- acq$timestamp[1]
+      trk <- player_track %>% filter(play_per_game == play, player_id == fid) %>%
+        arrange(timestamp)
+      p0 <- trk %>% filter(timestamp <= th) %>% tail(1)
+      p1 <- trk %>% filter(timestamp <= ta) %>% tail(1)
+      if (nrow(p0) && nrow(p1)) {
+        det$fielder <- unname(POS_ABBR[as.character(fid)])
+        det$route_ft <- round(sqrt((p1$field_x - p0$field_x)^2 +
+                                     (p1$field_y - p0$field_y)^2), 1)
+        det$time_to_ball <- round((ta - th) / 1000, 2)
+        sp <- speed_of(trk$field_x, trk$field_y, trk$timestamp)
+        if (length(sp)) det$closing_mph <- round(unname(quantile(sp, .9)) * FT_S_TO_MPH, 1)
+      }
+      thr <- e %>% filter(ball_eventcode %in% c(EVENT[["THROW"]], EVENT[["THROW_UNK"]]),
+                          player_id == fid, timestamp >= ta) %>% arrange(timestamp)
+      if (nrow(thr)) det$transfer_s <- round((thr$timestamp[1] - ta) / 1000, 2)
+    }
+
+    # Batter's run
+    bt <- player_track %>% filter(play_per_game == play, player_id == 10,
+                                  timestamp >= th) %>% arrange(timestamp)
+    if (nrow(bt) >= 4) {
+      sp <- speed_of(bt$field_x, bt$field_y, bt$timestamp)
+      if (length(sp)) det$sprint_mph <- round(unname(quantile(sp, .95)) * FT_S_TO_MPH, 1)
+    }
+  }
+  det
+}
+
+plays_payload <- lapply(seq_len(nrow(pbp_showcase)), function(i) {
+  r <- pbp_showcase[i, ]
+  d <- play_detail(r)
+  c(list(
+    idx = i - 1L,
+    inning = r$inning, half = r$half_inning, batter = r$batter,
+    pitcher = r$pitcher, outcome = r$outcome, runs = r$runs,
+    outs = r$outs_before, bases = BASE_STATES[r$base_state_before + 1],
+    home = r$home_score_after, away = r$away_score_after,
+    situation = r$situation,
+    wpa = round(r$wpa, 4), leverage = round(r$leverage_index, 2),
+    wp_home = round(ifelse(r$half_inning == "Bottom", r$wp_after, 1 - r$wp_after), 4),
+    play = r$last_play), d)
+})
+
+payload <- list(
+  meta = list(home = HOME_TEAM, away = AWAY_TEAM, game = SHOWCASE),
+  plays = plays_payload,
+  tracks = tracks)
+
+payload_json <- toJSON(payload, auto_unbox = TRUE, null = "null", digits = 4)
+```
+
+```{r}
+#| label: explorer
+#| echo: false
+#| output: asis
+
+# The interactive layer: R has computed everything above, and this embeds the
+# result with a small amount of vanilla JavaScript to draw the field and handle
+# clicks. No server and no Shiny -- the rendered HTML is fully standalone.
+#
+# Everything below is emitted inside a ```{=html} raw block. Without it Pandoc
+# treats any line indented four or more spaces as a MARKDOWN CODE BLOCK, which
+# is why the buttons first rendered as visible source text instead of controls.
+# The raw fence passes the whole thing through verbatim; the HTML is also
+# de-indented as a second line of defence.
+cat('```{=html}\n')
+
+cat('<style>
+.px-wrap{background:#12181f;color:#fff;border-radius:12px;padding:14px;
+ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.px-grid{display:grid;grid-template-columns:290px 1fr 260px;gap:12px}
+@media(max-width:1100px){.px-grid{grid-template-columns:1fr}}
+.px-panel{background:#161f2b;border-radius:10px;padding:10px}
+.px-panel h4{margin:0 0 8px;font-size:11px;letter-spacing:1.2px;color:#9fb0c0;
+ text-transform:uppercase}
+#px-list{max-height:560px;overflow-y:auto}
+.px-ab{padding:6px 8px;border-radius:7px;cursor:pointer;font-size:12.5px;
+ border-left:3px solid transparent;margin-bottom:2px}
+.px-ab:hover{background:#22303f}
+.px-ab.sel{background:#22303f;border-left-color:#ffc72c}
+.px-row{display:flex;justify-content:space-between;gap:6px}
+.px-meta{color:#9fb0c0;font-size:11px}
+.px-pos{color:#22c55e}.px-neg{color:#c8102e}
+.px-ctrl{display:flex;gap:7px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.px-btn{background:#22303f;color:#fff;border:0;border-radius:7px;padding:6px 12px;
+ font-weight:700;font-size:12px;cursor:pointer}
+.px-btn.p{background:#ffc72c;color:#000}
+.px-stat{background:#22303f;border-radius:8px;padding:8px;margin-bottom:6px}
+.px-stat .k{font-size:9.5px;color:#9fb0c0;letter-spacing:.6px;text-transform:uppercase}
+.px-stat .v{font-size:19px;font-weight:800}
+.px-narr{font-size:14px;margin:6px 0}
+</style>')
+
+cat('<div class="px-wrap"><div class="px-grid">
+<div class="px-panel"><h4>Plate appearances</h4><div id="px-list"></div></div>
+<div class="px-panel"><h4 id="px-title">Field replay</h4>
+<svg id="px-field" viewBox="0 0 640 470" style="width:100%;height:auto"></svg>
+<div class="px-ctrl">
+<button class="px-btn p" id="px-play">&#9654; Play</button>
+<button class="px-btn" id="px-prev">&#9664; Prev</button>
+<button class="px-btn" id="px-next">Next &#9654;</button>
+<input type="range" id="px-scrub" min="0" max="1000" value="0" style="flex:1">
+<span id="px-clock" style="color:#9fb0c0;font-size:11px"></span>
+</div>
+<div class="px-narr" id="px-narr"></div>
+</div>
+<div class="px-panel"><h4>The numbers</h4><div id="px-stats"></div></div>
+</div></div>')
+
+cat(paste0('<script>\nconst PX = ', payload_json, ';\n'))
+
+cat('
+const $ = function(i){ return document.getElementById(i); };
+let sel = 0, t = 0, timer = null;
+
+const VW=640, VH=470, MAXD=420;
+function fx(x){ return VW/2 + (x/MAXD)*(VW/2-14); }
+function fy(y){ return VH-24 - (y/MAXD)*(VH-48); }
+const LBL={1:"P",2:"C",3:"1B",4:"2B",5:"3B",6:"SS",7:"LF",8:"CF",9:"RF",
+           10:"BAT",11:"R1",12:"R2",13:"R3"};
+function col(pid){ pid=+pid; if(pid<=2) return "#ffffff";
+  if(pid<=6) return "#8fd4ff"; if(pid<=9) return "#ffd54a"; return "#ff7a90"; }
+
+function fieldBase(){
+  const H=[0,0],F=[63.64,63.64],S=[0,127.28],T=[-63.64,63.64];
+  const P=function(p){ return fx(p[0])+","+fy(p[1]); };
+  let s = "<rect width="+VW+" height="+VH+" fill=\\"#0b6b3a\\"/>";
+  s += "<polygon points=\\""+P(H)+" "+P(F)+" "+P(S)+" "+P(T)+"\\" fill=\\"#8a5a2b\\" opacity=\\".5\\"/>";
+  s += "<polyline points=\\""+P(H)+" "+P(F)+" "+P(S)+" "+P(T)+" "+P(H)+"\\" fill=\\"none\\" stroke=\\"#fff\\" stroke-width=\\"1.8\\"/>";
+  [F,T].forEach(function(b){ const n=Math.hypot(b[0],b[1]);
+    s += "<line x1="+fx(0)+" y1="+fy(0)+" x2="+fx(b[0]/n*MAXD*0.8)+" y2="+fy(b[1]/n*MAXD*0.8)+" stroke=\\"#fff\\" stroke-width=\\"1.3\\"/>"; });
+  [F,S,T].forEach(function(b){ s += "<rect x="+(fx(b[0])-3)+" y="+(fy(b[1])-3)+" width=6 height=6 fill=\\"#fff\\"/>"; });
+  s += "<circle cx="+fx(0)+" cy="+fy(60.5)+" r=8 fill=\\"#8a5a2b\\" stroke=\\"#fff\\"/>";
+  return s;
+}
+
+function curTrack(){ return PX.tracks[String(PX.plays[sel].play)] || null; }
+
+function draw(){
+  const tr = curTrack(); let s = fieldBase();
+  if(!tr){ $("px-field").innerHTML = s +
+    "<text x=16 y=26 fill=\\"#fff\\" font-size=13>No tracking for this play</text>"; return; }
+  const T = tr.t, dur = T[T.length-1] || 1, ms = Math.min(t, dur);
+  let i = 0; while(i < T.length-1 && T[i+1] <= ms) i++;
+  const j = Math.min(i+1, T.length-1);
+  const span = (T[j]-T[i]) || 1, f = Math.max(0, Math.min(1,(ms-T[i])/span));
+  const lp = function(a,b){ return a + (b-a)*f; };
+
+  let d = "";
+  for(let k=0;k<=i;k++){ d += (k?"L":"M") + fx(tr.bx[k]) + "," + fy(tr.by[k]); }
+  if(d) s += "<path d=\\""+d+"\\" fill=\\"none\\" stroke=\\"#fff\\" stroke-width=1.5 opacity=.6 stroke-dasharray=\\"3 3\\"/>";
+
+  for(const pid in tr.players){
+    const p = tr.players[pid];
+    const x = lp(p.x[i], p.x[j]), y = lp(p.y[i], p.y[j]);
+    s += "<circle cx="+fx(x)+" cy="+fy(y)+" r=5.5 fill=\\""+col(pid)+"\\" stroke=\\"#0a1017\\" stroke-width=1.2/>";
+    s += "<text x="+fx(x)+" y="+(fy(y)-8)+" fill=\\""+col(pid)+"\\" font-size=8.5 text-anchor=\\"middle\\" font-weight=700>"+(LBL[pid]||pid)+"</text>";
+  }
+  const bx = lp(tr.bx[i], tr.bx[j]), by = lp(tr.by[i], tr.by[j]),
+        bz = lp(tr.bz[i], tr.bz[j]);
+  const r = 4 + Math.max(0, Math.min(9, bz))*0.55;
+  s += "<circle cx="+fx(bx)+" cy="+fy(by)+" r="+r+" fill=\\"#fff\\" stroke=\\"#c8102e\\" stroke-width=1.4/>";
+
+  if(tr.events){
+    const names = {1:"PITCH",4:"CONTACT",2:"FIELDED",3:"THROW",5:"END OF PLAY",
+                   10:"OFF THE WALL",11:"HOME RUN",16:"BOUNCE"};
+    const ev = [].concat(tr.events.t ? tr.events.t.map(function(tt,k){
+      return {t:tt, code:tr.events.code[k]}; }) : tr.events);
+    ev.forEach(function(e){
+      if(Math.abs(e.t-ms) < 240 && names[e.code])
+        s += "<text x="+(VW/2)+" y=30 fill=\\"#ffc72c\\" font-size=17 font-weight=800 text-anchor=\\"middle\\">"+names[e.code]+"</text>";
+    });
+  }
+  $("px-field").innerHTML = s;
+  $("px-clock").textContent = (ms/1000).toFixed(1)+"s";
+  $("px-scrub").value = Math.round(1000*ms/dur);
+}
+
+function statBox(k,v){ return "<div class=\\"px-stat\\"><div class=\\"k\\">"+k+"</div><div class=\\"v\\">"+v+"</div></div>"; }
+
+function render(){
+  const p = PX.plays[sel];
+  $("px-title").textContent = p.situation;
+  const wpa = (p.wpa*100);
+  let words = p.batter + " — " + String(p.outcome).replace(/_/g," ");
+  if(p.runs > 0) words += ", " + p.runs + " in";
+  words += ". Win probability " + (wpa>=0?"+":"") + wpa.toFixed(0) + "%.";
+  $("px-narr").textContent = words;
+
+  let h = statBox("Win probability added",(wpa>=0?"+":"")+wpa.toFixed(0)+"%")
+        + statBox("Leverage", p.leverage.toFixed(2)+"x")
+        + statBox("Score", PX.meta.away+" "+p.away+" — "+PX.meta.home+" "+p.home);
+  if(p.pitch_velo)  h += statBox("Pitch velocity", p.pitch_velo+" mph");
+  if(p.exit_velo)   h += statBox("Exit velocity", p.exit_velo+" mph");
+  if(p.launch!=null)h += statBox("Launch angle", p.launch+"&deg;");
+  if(p.carry)       h += statBox("Carry", p.carry+" ft");
+  if(p.fielder)     h += statBox("Fielded by", p.fielder);
+  if(p.route_ft)    h += statBox("Ground covered", p.route_ft+" ft");
+  if(p.time_to_ball)h += statBox("Time to ball", p.time_to_ball+" s");
+  if(p.closing_mph) h += statBox("Closing speed", p.closing_mph+" mph");
+  if(p.transfer_s)  h += statBox("Transfer", p.transfer_s+" s");
+  if(p.sprint_mph)  h += statBox("Sprint speed", p.sprint_mph+" mph");
+  $("px-stats").innerHTML = h;
+
+  $("px-list").innerHTML = PX.plays.map(function(q,k){
+    const w = q.wpa*100;
+    return "<div class=\\"px-ab"+(k===sel?" sel":"")+"\\" onclick=\\"pxPick("+k+")\\">"
+      + "<div class=\\"px-row\\"><b>"+q.batter+"</b><span class=\\""+(w>=0?"px-pos":"px-neg")+"\\">"
+      + (w>=0?"+":"")+w.toFixed(0)+"%</span></div>"
+      + "<div class=\\"px-row\\"><span class=\\"px-meta\\">"+(q.half==="Top"?"\\u25B2":"\\u25BC")+q.inning
+      + " &middot; "+String(q.outcome).replace(/_/g," ")+"</span>"
+      + "<span class=\\"px-meta\\">LI "+q.leverage.toFixed(1)+"</span></div></div>";
+  }).join("");
+  const el = $("px-list").children[sel]; if(el) el.scrollIntoView({block:"nearest"});
+  draw();
+}
+
+function pxPick(k){ sel = Math.max(0, Math.min(PX.plays.length-1, k)); t = 0; stop(); render(); }
+function stop(){ if(timer){ clearInterval(timer); timer=null; $("px-play").innerHTML="&#9654; Play"; } }
+$("px-play").onclick = function(){
+  if(timer){ stop(); return; }
+  const tr = curTrack(); if(!tr) return;
+  const dur = tr.t[tr.t.length-1];
+  if(t >= dur) t = 0;
+  $("px-play").innerHTML = "&#10074;&#10074; Pause";
+  timer = setInterval(function(){
+    t += 40; const d = curTrack().t[curTrack().t.length-1];
+    if(t >= d){ t = d; draw(); stop(); return; } draw(); }, 40);
+};
+$("px-next").onclick = function(){ pxPick(sel+1); };
+$("px-prev").onclick = function(){ pxPick(sel-1); };
+$("px-scrub").oninput = function(e){
+  const tr = curTrack(); if(!tr) return;
+  t = tr.t[tr.t.length-1] * (+e.target.value/1000); draw();
+};
+pxPick(0);
+</script>')
+
+# Close the raw-HTML fence opened at the top of this chunk.
+cat('\n```\n')
+```
+
+---
+
+# Notes on method
+
+**What is deliberately not modelled.** The data has no umpire calls, so there is
+no supervised "called strike probability"; no steal or caught-stealing labels,
+so no steal probability; and no spin rate, which cannot be recovered from
+positional tracking. Only quantities the tracking actually supports are shown.
+
+**Known limitation.** Reaching on an error and a fielder's choice are not
+distinguishable from a single by occupancy alone, which is why hits run about
+10% above the real rate.
+
+**Reproducing this document.**
+
+```bash
+quarto render SMT_Play_Explorer.qmd
+```
+
+Set `SMT_DATA_ROOT` first if this file is not inside the challenge folder. The
+rendered HTML is fully standalone — the tracking data, charts and interactive
+explorer are all embedded, so it can be emailed or opened offline.

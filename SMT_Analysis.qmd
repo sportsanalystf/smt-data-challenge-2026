@@ -1,0 +1,285 @@
+---
+title: "The Robbery Meter — Reproducible Analysis"
+subtitle: "SMT Data Challenge 2026 · On the Big Screen!"
+author: "SMT Data Challenge Submission"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    number-sections: true
+    theme: cosmo
+  pdf:
+    toc: true
+    number-sections: true
+jupyter: python3
+---
+
+# Overview
+
+This document reproduces the full analysis behind **The Robbery Meter** — a
+calibrated outfield **catch-probability** model built from the SMT player- and
+ball-tracking data — together with the nine companion scoreboard metrics.
+
+The pipeline has three stages:
+
+1. **`extract_features.py`** — one pass over all 250 games producing play-level
+   feature tables (hits, pitches, throws, sprints, catch opportunities).
+2. **`extract_hits_v2.py`** — a cleaner ball-only pass for exit velocity, launch
+   angle, and carry distance.
+3. **`analyze.py`** — attributes plays to players via the lineup table, builds
+   the leaderboards, fits the catch-probability model, and renders the figures.
+
+Set `DATA_ROOT` to the folder that contains `ball-events/`, `ball-positions/`,
+`player-positions/`, `lineups.csv`, and `game-info.csv`.
+
+```{python}
+#| label: setup
+import os, glob
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+DATA_ROOT = os.environ.get("SMT_DATA_ROOT", ".")   # <-- point this at the data
+FT_S_TO_MPH = 0.681818                              # 1 ft/s -> mph
+OUTFIELD_IDS = [7, 8, 9]                            # LF, CF, RF
+INFIELD_IDS  = [3, 4, 5, 6]                         # 1B, 2B, 3B, SS
+POS_COL = {1:"pitcher",2:"catcher",3:"first_baseman",4:"second_baseman",
+           5:"third_baseman",6:"shortstop",7:"left_fielder",8:"center_fielder",
+           9:"right_fielder",10:"batter"}
+plt.rcParams.update({"figure.dpi":120, "axes.spines.top":False, "axes.spines.right":False})
+GREEN, ACCENT = "#0b6b3a", "#c8102e"
+```
+
+# The coordinate system and physics helpers
+
+The origin is at home plate; `x>0` points toward first base, `y>0` toward
+second base, `z` is height (feet). Tracking is sampled at 20 Hz (every 50 ms).
+Speed is finite-differenced from consecutive frames, with light smoothing.
+
+```{python}
+#| label: helpers
+def _smooth(a, k=3):
+    if len(a) < k: return a
+    return np.convolve(a, np.ones(k)/k, mode="same")
+
+def ball_speed_3d(df):
+    d = df.sort_values("timestamp")
+    tt = d.timestamp.to_numpy(float)
+    x,y,z = (d[c].to_numpy(float) for c in
+             ["ball_position_x","ball_position_y","ball_position_z"])
+    dt = np.diff(tt)/1000.0
+    dist = np.sqrt(np.diff(x)**2+np.diff(y)**2+np.diff(z)**2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(dt>0, dist/dt, np.nan)
+
+def player_speed(df):
+    d = df.sort_values("timestamp")
+    tt = d.timestamp.to_numpy(float)
+    x,y = _smooth(d.field_x.to_numpy(float)), _smooth(d.field_y.to_numpy(float))
+    dt = np.diff(tt)/1000.0
+    dist = np.sqrt(np.diff(x)**2+np.diff(y)**2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(dt>0, dist/dt, np.nan)
+```
+
+# Feature extraction
+
+For runtime, the full 250-game extraction is done by the provided scripts:
+
+```bash
+# all metric families (needs player tracking; ~6 min total)
+python code/extract_features.py  <DATA_ROOT> outputs/feat 0 250
+# cleaner batted-ball metrics (ball only; ~40 s)
+python code/extract_hits_v2.py   <DATA_ROOT> outputs/feat/hits_v2.csv 0 250
+```
+
+The core logic that turns one play into a **catch opportunity** — the heart of
+the Robbery Meter — is shown below (see `extract_features.py` for the complete
+loop). A batted ball (`ball_eventcode == 4`) that carries past the infield is an
+opportunity; it is *caught* when an outfielder acquires it (`ball_eventcode == 2`,
+`player_id in {7,8,9}`). We then measure the fielder's **route distance**,
+**hang time**, and derived **required speed**.
+
+```{python}
+#| label: catch-logic
+#| eval: false
+# --- per play, given events e, ball b, player tracking pl ---
+t_hit = int(e[e.ball_eventcode==4].timestamp.iloc[0])
+after = e[e.timestamp > t_hit]
+caught, fielder, t_end = 0, None, None
+for _, r in after.iterrows():
+    if r.ball_eventcode==2 and int(r.player_id) in OUTFIELD_IDS:
+        caught, fielder, t_end = 1, int(r.player_id), int(r.timestamp); break
+    if r.ball_eventcode in (2,5) and int(r.player_id) in INFIELD_IDS:
+        break  # stayed in the infield
+
+hd = np.max(np.hypot(b.ball_position_x, b.ball_position_y))
+if hd > 130:                                  # reached the outfield
+    ftrk  = pl[(pl.play_per_game==play) & (pl.player_id==fielder)]
+    start = ftrk[ftrk.timestamp <= t_hit].iloc[-1][["field_x","field_y"]].to_numpy(float)
+    end   = ftrk[ftrk.timestamp <= t_end].iloc[-1][["field_x","field_y"]].to_numpy(float)
+    route = np.hypot(*(end-start))
+    hang  = (t_end - t_hit)/1000.0
+    req   = np.clip(route/hang, 0, 45)        # required closing speed
+```
+
+# Load the extracted features
+
+```{python}
+#| label: load
+FEAT = os.environ.get("SMT_FEAT_DIR", "outputs/feat")
+def _rd(name): return pd.read_csv(os.path.join(FEAT, name))
+try:
+    hits    = _rd("hits_v2.csv").rename(columns={"carry_ft":"hit_distance_ft"})
+    pitches = _rd("pitches.csv")
+    throws  = _rd("throws.csv")
+    sprints = _rd("sprints.csv")
+    catches = _rd("catches.csv")
+    lu = pd.read_csv(os.path.join(DATA_ROOT, "lineups.csv")).drop_duplicates(
+            ["game_string","play_per_game"])
+    print({k:len(v) for k,v in dict(hits=hits,pitches=pitches,throws=throws,
+                                    sprints=sprints,catches=catches).items()})
+except FileNotFoundError:
+    print("Run the extraction scripts first (see section above).")
+```
+
+# The catch-probability model (flagship)
+
+A logistic regression on three standardized features — `route_ft`, `hang_s`,
+`req_speed` — implemented in NumPy for full transparency.
+
+```{python}
+#| label: model
+c = catches[(catches.hang_s>0.4) & (catches.route_ft.between(0,160))].copy()
+c["req_speed"] = (c.route_ft/c.hang_s).clip(0,45)
+X = c[["route_ft","hang_s","req_speed"]].to_numpy(float)
+y = c["catch_made"].to_numpy(float)
+mu, sd = X.mean(0), X.std(0)
+Xd = np.hstack([np.ones((len(X),1)), (X-mu)/sd])
+
+def fit_logistic(Xd, y, l2=1.0, iters=500, lr=0.3):
+    w = np.zeros(Xd.shape[1]); n=len(y)
+    for _ in range(iters):
+        p = 1/(1+np.exp(-(Xd@w)))
+        w -= lr*(Xd.T@(p-y)/n + l2*np.r_[0,w[1:]]/n)
+    return w
+
+w = fit_logistic(Xd, y)
+c["catch_prob"] = 1/(1+np.exp(-(Xd@w)))
+acc   = ((c.catch_prob>=.5).astype(int)==c.catch_made).mean()
+brier = np.mean((c.catch_prob-c.catch_made)**2)
+print(f"n={len(c)}  base_rate={c.catch_made.mean():.3f}  "
+      f"accuracy={acc:.3f}  brier={brier:.3f}")
+```
+
+```{python}
+#| label: fig-model
+#| fig-cap: "Catch probability vs. route distance for several hang times."
+fig, ax = plt.subplots(figsize=(7,4.2))
+routes = np.linspace(0,130,120)
+for hang in [2,3,4,5]:
+    req = np.clip(routes/hang,0,45)
+    Xg = (np.column_stack([routes, np.full_like(routes,hang), req])-mu)/sd
+    Xg = np.hstack([np.ones((len(Xg),1)), Xg])
+    ax.plot(routes, 1/(1+np.exp(-(Xg@w))), lw=2.4, label=f"{hang} s")
+ax.set(xlabel="Route distance (ft)", ylabel="Catch probability", ylim=(0,1.02))
+ax.set_title("The Robbery Meter", color=GREEN, fontweight="bold")
+ax.legend(title="Hang time", frameon=False); ax.grid(alpha=.25)
+plt.show()
+```
+
+# Scoreboard products from the model
+
+```{python}
+#| label: products
+def player_of(row, id_col="fielder_id"):
+    key=(row.game_string, row.play); col=POS_COL.get(int(row[id_col]))
+    m=lu[(lu.game_string==key[0]) & (lu.play_per_game==key[1])]
+    return m[col].iloc[0] if (len(m) and col) else None
+
+c["player"] = c.apply(player_of, axis=1)
+c["pos"]    = c.fielder_id.map(POS_COL)
+c["oae"]    = c.catch_made - c.catch_prob
+
+# 1) Outs Above Expected leaderboard
+oae = (c.dropna(subset=["player"]).groupby("player")
+         .agg(opps=("oae","size"), made=("catch_made","sum"),
+              expected=("catch_prob","sum"), oae=("oae","sum"),
+              pos=("pos","first")).reset_index())
+oae = oae[oae.opps>=12].sort_values("oae", ascending=False).round(2)
+print("Top defenders (Outs Above Expected):"); print(oae.head(5).to_string(index=False))
+
+# 2) Web Gems — completed catches with the lowest probability
+gems = c[c.catch_made==1].copy()
+gems["robbery_score"] = (100*(1-gems.catch_prob)).round(1)
+print("\nWeb Gem of the season:")
+print(gems.sort_values("catch_prob").head(3)
+        [["player","pos","route_ft","hang_s","catch_prob","robbery_score"]]
+        .to_string(index=False))
+
+# 3) Catch or No Catch? — suspense plays nearest a coin flip
+c["suspense"] = 1-(2*(c.catch_prob-0.5)).abs()
+print("\nBest 'Catch or No Catch?' vote candidates (nearest 50%):")
+print(c.dropna(subset=["player"]).sort_values("suspense",ascending=False).head(3)
+        [["player","pos","route_ft","hang_s","catch_prob","catch_made"]]
+        .to_string(index=False))
+```
+
+# Companion metrics (the scoreboard suite)
+
+Each of the nine companion features is a short aggregation over the extracted
+tables. Two representative examples:
+
+```{python}
+#| label: companions
+def attach(df, col):
+    m = lu[["game_string","play_per_game",col]].rename(
+        columns={"play_per_game":"play", col:"player"})
+    out = df.merge(m, on=["game_string","play"], how="left")
+    out["team"] = out.player.str.split("-").str[0]
+    return out
+
+# Burner Board — top sprint speed to first
+s = attach(sprints, "batter").dropna(subset=["player"])
+burner = (s.groupby("player").agg(top_mph=("sprint_mph","max"),
+          runs=("sprint_mph","size")).reset_index())
+burner = burner[burner.runs>=3].sort_values("top_mph",ascending=False)
+print("Burner Board (top 5):"); print(burner.head(5).to_string(index=False))
+
+# Statcast Smash — exit velocity
+h = attach(hits, "batter").dropna(subset=["player"])
+smash = (h.groupby("player").agg(max_ev=("exit_velo_mph","max"),
+         p90_ev=("exit_velo_mph", lambda x: round(np.percentile(x,90),1)),
+         balls=("exit_velo_mph","size")).reset_index())
+smash = smash[smash.balls>=5].sort_values(["p90_ev","max_ev"],ascending=False)
+print("\nStatcast Smash (top 5):"); print(smash.head(5).to_string(index=False))
+```
+
+The remaining companions — Moonshot Meter, Radar Gun Live, Outfield Cannons,
+Barrel Zone, Ground Crew Range, and the Five-Tool Scoreboard — follow the same
+pattern and are produced in full by `analyze.py`, which writes one CSV
+leaderboard per idea to `outputs/leaderboards/` and the figures to
+`outputs/figures/`.
+
+# Reproducing everything end to end
+
+```bash
+python code/extract_features.py  <DATA_ROOT> outputs/feat 0 250
+python code/extract_hits_v2.py   <DATA_ROOT> outputs/feat/hits_v2.csv 0 250
+python code/analyze.py           <DATA_ROOT> outputs/feat outputs
+python code/plot_webgem.py       <DATA_ROOT> outputs
+quarto render SMT_Analysis.qmd
+```
+
+# Notes on validity
+
+Metrics are computed from finite-differenced tracking and are approximate:
+route distance is straight-line (not the fielder's curved path); exit and pitch
+velocities use a smoothed 90th-percentile of instantaneous ball speed to resist
+single-frame spikes; implausible spikes are filtered (e.g., pitch velocity is
+capped at 103 mph, the plausible ceiling for this level). All leaderboard
+values are within-sample for a single anonymized Level-7 season.
